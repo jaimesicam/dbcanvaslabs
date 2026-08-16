@@ -1,0 +1,14 @@
+.git
+.gitignore
+node_modules
+dist
+.run
+.env
+server/dbonlinetest-server
+server/server
+server/web/dist
+**/*.log
+.DS_Store
+# The lab toolbox is its own image, built on the host by `make toolbox` — nothing in it
+# belongs in the app image.
+toolbox

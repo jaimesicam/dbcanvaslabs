@@ -1,0 +1,40 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dbonlinetest:latest
+    # No `platform:` pin on purpose. Everything this app runs — k3s, CloudNativePG,
+    # PostgreSQL, SeaweedFS, MetalLB — is published multi-arch, so the host's native
+    # architecture is always the right answer and emulating a foreign one would make
+    # provisioning drastically slower. Force one with Docker's own DOCKER_DEFAULT_PLATFORM
+    # if you really need to.
+    environment:
+      # The container always listens on all interfaces internally (the Dockerfile sets
+      # APP_HOST=0.0.0.0); host-side exposure is controlled by the publish binding
+      # below, not by this value.
+      APP_PORT: ${APP_PORT:-8090}
+      DOCKER_SOCK: /var/run/docker.sock
+    ports:
+      # Publish on APP_HOST (default 127.0.0.1 = this machine only). This app hands
+      # every visitor a root shell inside a real Kubernetes node, so set
+      # APP_HOST=0.0.0.0 in .env only when you actually mean to share it.
+      - "${APP_HOST:-127.0.0.1}:${APP_PORT:-8090}:${APP_PORT:-8090}"
+    volumes:
+      # The whole point of the deployment shape: the app provisions real lab
+      # environments by driving the host's Docker daemon (Docker-out-of-Docker) — k3d
+      # node containers, a SeaweedFS container and a network per attempt, all created
+      # as *siblings* of this container. It speaks the Engine API over this socket with
+      # only the Go stdlib; the one binary it shells out to is k3d, baked into the image.
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/dbonlinetest-server", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+# No volumes: this app persists nothing. Courseware state (accounts, attempts, scores)
+# is a localStorage mock in the browser, and lab environments are disposable by design —
+# a restart deliberately reclaims every one it finds (see ReapOrphans in attempts.go).

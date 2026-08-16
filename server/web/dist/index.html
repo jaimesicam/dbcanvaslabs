@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>DBCanvas Labs — UI not embedded</title>
+<style>
+  body { font: 14px/1.6 ui-sans-serif, system-ui, sans-serif; max-width: 34rem; margin: 12vh auto; padding: 0 1.5rem; color: #d6dae2; background: #0e1117; }
+  code { background: #1b212b; padding: .1rem .35rem; border-radius: 3px; }
+  h1 { font-size: 1rem; }
+</style>
+<h1>This binary has no UI embedded.</h1>
+<p>
+  You are talking to a <strong>natively built</strong> <code>dbonlinetest-server</code>. It serves
+  <code>/api</code> correctly, but the React app was not compiled into it — this placeholder is what
+  <code>//go:embed all:web/dist</code> found in the source tree.
+</p>
+<p>
+  That is the expected shape of the development workflow: run <code>make dev</code> and open the Vite
+  dev server instead, which proxies <code>/api</code> here.
+</p>
+<p>
+  For the deployed shape — one container, UI and API on one port — build the image:
+  <code>make up</code> (<code>docker compose up --build -d</code>). The image build writes the real
+  Vite output over this file before compiling.
+</p>

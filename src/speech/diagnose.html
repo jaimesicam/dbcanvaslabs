@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Web Speech diagnosis — DBCanvas Labs</title>
+<style>
+  body { font: 14px/1.6 ui-sans-serif, system-ui, sans-serif; max-width: 46rem; margin: 6vh auto; padding: 0 1.5rem;
+         color: #d6dae2; background: #0e1117; }
+  h1 { font-size: 1.05rem; }
+  button { font: inherit; padding: .5rem .9rem; border: 1px solid #2b3340; background: #1b212b; color: #d6dae2;
+           border-radius: 4px; cursor: pointer; margin: 0 .4rem .4rem 0; }
+  button:hover { border-color: #6366f1; }
+  #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; background: #0a0d12;
+         border: 1px solid #2b3340; border-radius: 4px; padding: .8rem; margin-top: 1rem; max-height: 26rem;
+         overflow: auto; }
+  .ok { color: #4ade80 } .bad { color: #f87171 } .warn { color: #fbbf24 } .dim { color: #7d8798 }
+</style>
+</head>
+<body>
+<h1>Web Speech diagnosis</h1>
+<p class="dim">
+  Open this file directly in the browser that is not speaking (<code>open src/speech/diagnose.html</code>).
+  It exercises <code>speechSynthesis</code> exactly the way the app does and reports what the browser
+  actually did — including the failure modes that are otherwise completely silent.
+</p>
+
+<p>
+  <button id="auto">1 · Speak with no click first (autoplay policy)</button>
+  <button id="basic">2 · Speak one line</button>
+  <button id="cancel">3 · cancel() then speak() in the same tick</button>
+  <button id="queue">4 · Queue 6 blocks, like a real briefing</button>
+  <button id="voices">5 · List voices</button>
+  <button id="clear">clear</button>
+</p>
+
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById('log')
+const t0 = Date.now()
+function log(msg, cls) {
+  const line = document.createElement('div')
+  if (cls) line.className = cls
+  line.textContent = `+${String(Date.now() - t0).padStart(5)}ms  ${msg}`
+  logEl.appendChild(line)
+  logEl.scrollTop = logEl.scrollHeight
+}
+
+const synth = window.speechSynthesis
+if (!synth) {
+  log('speechSynthesis is NOT available in this browser at all.', 'bad')
+} else {
+  log('speechSynthesis present. userActivation: ' +
+      (navigator.userActivation ? JSON.stringify({
+        hasBeenActive: navigator.userActivation.hasBeenActive,
+        isActive: navigator.userActivation.isActive,
+      }) : 'API not supported'), 'dim')
+  log(`getVoices() immediately: ${synth.getVoices().length} voice(s)`, synth.getVoices().length ? 'ok' : 'warn')
+  synth.addEventListener('voiceschanged', () => {
+    log(`voiceschanged fired: ${synth.getVoices().length} voice(s)`, 'ok')
+  })
+}
+
+function say(text, tag) {
+  const u = new SpeechSynthesisUtterance(text)
+  const voices = synth.getVoices()
+  const v = voices.find((x) => x.lang === 'en-US' && x.default) || voices.find((x) => x.lang === 'en-US') || voices[0]
+  if (v) { u.voice = v; u.lang = v.lang } else { u.lang = 'en-US' }
+  u.rate = 0.95
+  u.onstart = () => log(`[${tag}] onstart — audio is playing (voice: ${u.voice ? u.voice.name : 'browser default'})`, 'ok')
+  u.onend = () => log(`[${tag}] onend`, 'dim')
+  u.onerror = (e) => {
+    const why = e.error === 'not-allowed'
+      ? 'BLOCKED by the autoplay policy — the page has had no user gesture yet'
+      : e.error
+    log(`[${tag}] onerror: ${why}`, 'bad')
+  }
+  let boundaries = 0
+  u.onboundary = (e) => {
+    boundaries++
+    if (boundaries <= 3) log(`[${tag}] boundary ${e.name || 'word'} @char ${e.charIndex}`, 'dim')
+    if (boundaries === 4) log(`[${tag}] …further boundary events suppressed`, 'dim')
+  }
+  synth.speak(u)
+  log(`[${tag}] speak() called. speaking=${synth.speaking} pending=${synth.pending} paused=${synth.paused}`, 'dim')
+  setTimeout(() => {
+    if (!boundaries) log(`[${tag}] 2s later: no boundary events. speaking=${synth.speaking} pending=${synth.pending} paused=${synth.paused}`, 'warn')
+  }, 2000)
+}
+
+// Fires without any click — this is the case Chrome refuses.
+document.getElementById('auto').onclick = () => {
+  log('--- test 1: this button IS a gesture, so reload the page and watch the automatic attempt below instead ---', 'warn')
+  say('Testing whether this browser will speak.', 'auto')
+}
+document.getElementById('basic').onclick = () => {
+  log('--- test 2: plain speak ---')
+  say('Install the CloudNativePG operator into the cluster.', 'basic')
+}
+document.getElementById('cancel').onclick = () => {
+  log('--- test 3: cancel() immediately followed by speak() — the Chrome dispatcher bug ---')
+  synth.cancel()
+  say('This line is queued in the very same tick as cancel.', 'same-tick')
+  setTimeout(() => {
+    log('--- and now the same thing with one tick of delay, which is what the app does ---')
+    synth.cancel()
+    setTimeout(() => say('This line is queued one tick after cancel.', 'next-tick'), 60)
+  }, 3500)
+}
+document.getElementById('queue').onclick = () => {
+  log('--- test 4: six queued utterances, like a real objective briefing ---')
+  synth.cancel()
+  setTimeout(() => {
+    ;[
+      'Objective two. Install the CloudNativePG operator.',
+      'Install the operator into the cluster, from the release manifest staged on k3d server.',
+      'Switch to the k3d server tab. That is the only node the source was unpacked on.',
+      'Registering CRDs is not the same as being usable.',
+      'It counts as done when:',
+      'The operator pod is running.',
+    ].forEach((line, i) => say(line, 'block' + i))
+  }, 60)
+}
+document.getElementById('voices').onclick = () => {
+  const vs = synth.getVoices()
+  log(`--- ${vs.length} voice(s) ---`)
+  vs.filter((v) => v.lang.startsWith('en')).forEach((v) => {
+    log(`  ${v.name}  [${v.lang}]${v.default ? '  (default)' : ''}${v.localService ? '' : '  (network)'}`)
+  })
+}
+document.getElementById('clear').onclick = () => { logEl.innerHTML = '' }
+
+// The real test of the autoplay policy: speak on load, with no gesture whatsoever.
+window.addEventListener('load', () => {
+  setTimeout(() => {
+    log('--- automatic attempt on page load, with no user gesture (this is what the app does) ---', 'warn')
+    say('Narration is working.', 'on-load')
+  }, 400)
+})
+</script>
+</body>
+</html>

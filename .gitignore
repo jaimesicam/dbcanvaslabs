@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# The placeholder the Go binary embeds when built natively (see server/main.go). The
+# real Vite output is written over it inside the image build and is never committed.
+!server/web/dist/
+!server/web/dist/index.html
+server/web/dist/assets/
+
+# server/ (Go backend)
+server/dbonlinetest-server
+server/server
+
+# make dev process logs
+.run/
+
+# local compose overrides
+.env

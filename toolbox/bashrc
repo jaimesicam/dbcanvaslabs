@@ -1,0 +1,29 @@
+# DBCanvas Labs toolbox — the shell a learner lands in.
+#
+# Deliberately close to a plain root bash prompt. The labs teach commands, so anything
+# clever here (heavy aliasing, a framework prompt) would mean the transcript in the lab
+# instructions does not match what the learner sees. Completion and history are the
+# exceptions: they make the box usable without changing what any command does.
+
+[ -z "$PS1" ] && return
+
+HISTSIZE=10000
+HISTFILESIZE=10000
+HISTCONTROL=ignoreboth
+shopt -s histappend checkwinsize
+
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+alias grep='grep --color=auto'
+
+PS1='\[\e[1;36m\]toolbox\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+
+[ -f /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion
+
+if command -v kubectl >/dev/null 2>&1; then
+    source <(kubectl completion bash)
+fi
+
+export KUBECONFIG=/root/.kube/config
+export PAGER=less
+export EDITOR=vim
