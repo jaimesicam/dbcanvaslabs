@@ -489,6 +489,62 @@ func RunCheck(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, taskID 
 		return checkInitdb(ctx, k3d, docker, a, server, taskID)
 	case "cnpg-taints-tolerations":
 		return checkTaintsTolerations(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-node-selector":
+		return checkNodeSelector(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-podspec-drift":
+		return checkPodSpecDrift(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-in-place-upgrade":
+		return checkInPlaceUpgrade(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-multi-arch":
+		return checkMultiArch(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-inherited-metadata":
+		return checkInheritedMetadata(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-object-metadata":
+		return checkObjectMetadata(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-data-corruption":
+		return checkDataCorruption(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-basebackup-clone":
+		return checkBasebackupClone(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-import-microservice":
+		return checkImportMicroservice(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-import-monolith":
+		return checkImportMonolith(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-storage-expansion":
+		return checkStorageExpansion(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-wal-volume":
+		return checkWALVolume(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-node-drain":
+		return checkNodeDrain(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-single-instance-drain":
+		return checkSingleInstanceDrain(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-declarative-hibernation":
+		return checkDeclarativeHibernation(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-snapshot-modes":
+		return checkSnapshotModes(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-snapshot-pitr":
+		return checkSnapshotPITR(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-plugin-snapshot-backup":
+		return checkPluginSnapshotBackup(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-scheduled-snapshots":
+		return checkScheduledSnapshots(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-managed-roles":
+		return checkManagedRoles(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-role-passwords":
+		return checkRolePasswords(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-tablespaces":
+		return checkTablespaces(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-temporary-tablespaces":
+		return checkTemporaryTablespaces(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-declarative-databases":
+		return checkDeclarativeDatabases(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-database-reclaim":
+		return checkDatabaseReclaim(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-tablespace-backup":
+		return checkTablespaceBackup(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-tablespace-snapshot":
+		return checkTablespaceSnapshot(ctx, k3d, docker, a, server, taskID)
+	case "cnpg-major-upgrade":
+		return checkMajorUpgrade(ctx, k3d, docker, a, server, taskID)
 	}
 	return CheckResult{}, fmt.Errorf("unknown lab %q", a.labID)
 }
@@ -2237,6 +2293,4086 @@ func checkTaintsTolerations(ctx context.Context, k3d *K3D, docker *Docker, a *At
 		return finish(checks), nil
 	}
 	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-taints-tolerations", taskID)
+}
+
+/* ---- Labs 44–49: pod scheduling, and the metadata on the objects ---- */
+
+// instancePod is one instance Pod as the scheduling and metadata labs read it. The leaner
+// podList above carries none of what they grade on: the metadata the operator writes, the
+// placement it asked for, the resources it requested, and when this particular Pod came
+// into existence — which is the only honest way to tell a rebuilt Pod from a surviving one.
+type instancePod struct {
+	Metadata struct {
+		Name              string            `json:"name"`
+		Labels            map[string]string `json:"labels"`
+		Annotations       map[string]string `json:"annotations"`
+		CreationTimestamp time.Time         `json:"creationTimestamp"`
+	} `json:"metadata"`
+	Spec struct {
+		NodeName     string            `json:"nodeName"`
+		NodeSelector map[string]string `json:"nodeSelector"`
+		Affinity     podAffinity       `json:"affinity"`
+		Containers   []struct {
+			Name      string `json:"name"`
+			Resources struct {
+				Requests map[string]string `json:"requests"`
+				Limits   map[string]string `json:"limits"`
+			} `json:"resources"`
+		} `json:"containers"`
+	} `json:"spec"`
+	Status struct {
+		Phase             string `json:"phase"`
+		PodIP             string `json:"podIP"`
+		ContainerStatuses []struct {
+			Ready        bool `json:"ready"`
+			RestartCount int  `json:"restartCount"`
+		} `json:"containerStatuses"`
+	} `json:"status"`
+}
+
+// podAffinity is only ever read for its topology key — the one field of the generated rule
+// these labs ask about, and the one the Cluster spec does not show until it is overridden.
+type podAffinity struct {
+	PodAntiAffinity struct {
+		Preferred []struct {
+			Weight          int `json:"weight"`
+			PodAffinityTerm struct {
+				TopologyKey string `json:"topologyKey"`
+			} `json:"podAffinityTerm"`
+		} `json:"preferredDuringSchedulingIgnoredDuringExecution"`
+		Required []struct {
+			TopologyKey string `json:"topologyKey"`
+		} `json:"requiredDuringSchedulingIgnoredDuringExecution"`
+	} `json:"podAntiAffinity"`
+}
+
+// topologyKey returns the key the generated anti-affinity rule spreads on, whichever of the
+// two forms the operator wrote, and "" if there is no rule at all.
+func (a podAffinity) topologyKey() string {
+	for _, p := range a.PodAntiAffinity.Preferred {
+		if p.PodAffinityTerm.TopologyKey != "" {
+			return p.PodAffinityTerm.TopologyKey
+		}
+	}
+	for _, r := range a.PodAntiAffinity.Required {
+		if r.TopologyKey != "" {
+			return r.TopologyKey
+		}
+	}
+	return ""
+}
+
+func (p instancePod) ready() bool {
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.Ready {
+			return true
+		}
+	}
+	return false
+}
+
+func (p instancePod) restarts() int {
+	n := 0
+	for _, cs := range p.Status.ContainerStatuses {
+		n += cs.RestartCount
+	}
+	return n
+}
+
+// requestedMemory is what the postgres container asks for, or "" when nothing was requested.
+func (p instancePod) requestedMemory() string {
+	for _, c := range p.Spec.Containers {
+		if c.Name == "postgres" {
+			return c.Resources.Requests["memory"]
+		}
+	}
+	return ""
+}
+
+// readInstancePods lists a cluster's instance Pods — the real instances only, since the
+// short-lived initdb and join Jobs carry the same cluster label but not the instance role.
+func readInstancePods(ctx context.Context, k3d *K3D, server, cluster string) ([]instancePod, error) {
+	var list struct {
+		Items []instancePod `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "pods", "-l", "cnpg.io/podRole=instance,cnpg.io/cluster="+cluster); err != nil {
+		return nil, err
+	}
+	sort.Slice(list.Items, func(i, j int) bool {
+		return list.Items[i].Metadata.Name < list.Items[j].Metadata.Name
+	})
+	return list.Items, nil
+}
+
+func instanceByName(pods []instancePod, name string) (instancePod, bool) {
+	for _, p := range pods {
+		if p.Metadata.Name == name {
+			return p, true
+		}
+	}
+	return instancePod{}, false
+}
+
+// nodesUsed counts how many distinct nodes the instances are spread over, which is what
+// "one instance per node" means when it is graded rather than eyeballed.
+func nodesUsed(pods []instancePod) int {
+	seen := map[string]bool{}
+	for _, p := range pods {
+		if p.Spec.NodeName != "" {
+			seen[p.Spec.NodeName] = true
+		}
+	}
+	return len(seen)
+}
+
+func runningCount(pods []instancePod) int {
+	n := 0
+	for _, p := range pods {
+		if p.Status.Phase == "Running" {
+			n++
+		}
+	}
+	return n
+}
+
+// clusterAffinity is the Cluster's own scheduling block. podAntiAffinityType is defaulted
+// into it by the operator's webhook — it reads "preferred" on a Cluster nobody has touched —
+// while topologyKey stays empty until somebody sets it.
+type clusterAffinity struct {
+	NodeSelector        map[string]string `json:"nodeSelector"`
+	PodAntiAffinityType string            `json:"podAntiAffinityType"`
+	TopologyKey         string            `json:"topologyKey"`
+}
+
+func readClusterAffinity(ctx context.Context, k3d *K3D, server, cluster string) (clusterAffinity, error) {
+	var c struct {
+		Spec struct {
+			Affinity clusterAffinity `json:"affinity"`
+		} `json:"spec"`
+	}
+	err := kubectlJSON(ctx, k3d, server, &c, "get", "cluster.postgresql.cnpg.io", cluster)
+	return c.Spec.Affinity, err
+}
+
+// failedSchedulingSaying looks for a FailedScheduling event whose message contains needle,
+// and returns that message. The scheduler's own words are the evidence for every "and here
+// is why it would not schedule" objective in these labs — nothing else records the reason
+// once the Pod has been placed after all.
+func failedSchedulingSaying(ctx context.Context, k3d *K3D, server, needle string) (string, bool) {
+	var ev struct {
+		Items []struct {
+			Message string `json:"message"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &ev, "get", "events", "--field-selector", "reason=FailedScheduling"); err != nil {
+		return "", false
+	}
+	for _, e := range ev.Items {
+		if strings.Contains(e.Message, needle) {
+			return firstLine(e.Message), true
+		}
+	}
+	return "", false
+}
+
+// metaList reads just the metadata of a set of objects — enough for every "did this label
+// reach everything the operator generated" check.
+type metaList struct {
+	Items []struct {
+		Metadata struct {
+			Name        string            `json:"name"`
+			Labels      map[string]string `json:"labels"`
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	} `json:"items"`
+}
+
+func readMeta(ctx context.Context, k3d *K3D, server, kind string, args ...string) metaList {
+	var list metaList
+	_ = kubectlJSON(ctx, k3d, server, &list, append([]string{"get", kind}, args...)...)
+	return list
+}
+
+// everyItemHasLabel reports whether every object in the list carries key=value, and how many
+// did — a count is what makes a failed check readable ("2 of 3").
+func (m metaList) everyItemHasLabel(key, value string) (bool, int) {
+	n := 0
+	for _, it := range m.Items {
+		if it.Metadata.Labels[key] == value {
+			n++
+		}
+	}
+	return len(m.Items) > 0 && n == len(m.Items), n
+}
+
+func (m metaList) everyItemHasAnnotation(key, value string) (bool, int) {
+	n := 0
+	for _, it := range m.Items {
+		if it.Metadata.Annotations[key] == value {
+			n++
+		}
+	}
+	return len(m.Items) > 0 && n == len(m.Items), n
+}
+
+// execInPod runs one command inside an instance Pod's postgres container. The multi-arch lab
+// grades what the *image* reports about itself, which only the image can answer.
+func execInPod(ctx context.Context, docker *Docker, server, pod string, cmd ...string) (string, bool) {
+	full := append([]string{"kubectl", "exec", pod, "-c", "postgres", "--"}, cmd...)
+	res, err := docker.ExecRoot(ctx, server, full, []string{"KUBECONFIG=" + k3dKubeconfig})
+	if err != nil || res.ExitCode != 0 {
+		return "", false
+	}
+	return strings.TrimSpace(res.Stdout), true
+}
+
+/* ---- Lab 44: Node Selectors and Pod Anti-Affinity ---- */
+
+func checkNodeSelector(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods, err := readInstancePods(ctx, k3d, server, cluster)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	affinity, err := readClusterAffinity(ctx, k3d, server, cluster)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	placement := fmt.Sprintf("%d Running across %d node(s), %s", runningCount(pods), nodesUsed(pods), c.Status.Phase)
+
+	switch taskID {
+	case "read-defaults":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(runningCount(pods) == 3 && nodesUsed(pods) == 3,
+			"All 3 instances are Running, one on each node", placement))
+		checks = append(checks, boolCheck(affinity.PodAntiAffinityType == "preferred",
+			"The Cluster asks for preferred anti-affinity — a value nobody wrote",
+			detailOr("spec.affinity.podAntiAffinityType is "+affinity.PodAntiAffinityType,
+				"podAntiAffinityType: preferred", affinity.PodAntiAffinityType != "preferred")))
+
+		// Read off a Pod, not off the Cluster: the topology key the rule actually uses is not
+		// in the spec until somebody overrides it.
+		key := ""
+		if len(pods) > 0 {
+			key = pods[0].Spec.Affinity.topologyKey()
+		}
+		body, found := readFileAnyNode(ctx, docker, a, "/root/topology-key.txt")
+		if !found {
+			checks = append(checks, noItem("/root/topology-key.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/topology-key.txt was written", "found"))
+		checks = append(checks, boolCheck(key != "" && strings.Contains(body, key),
+			"It names the topology key the generated rule spreads on",
+			fmt.Sprintf("file says %q, the rule uses %q", firstLine(body), key)))
+		return finish(checks), nil
+
+	case "node-selector":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(len(affinity.NodeSelector) > 0,
+			"The Cluster declares a nodeSelector",
+			detailOr("spec.affinity.nodeSelector is empty",
+				fmt.Sprintf("%v", affinity.NodeSelector), len(affinity.NodeSelector) == 0)))
+
+		stamped := len(pods) > 0
+		for _, p := range pods {
+			for k, v := range affinity.NodeSelector {
+				if p.Spec.NodeSelector[k] != v {
+					stamped = false
+				}
+			}
+		}
+		checks = append(checks, boolCheck(stamped && len(affinity.NodeSelector) > 0,
+			"Every instance Pod carries it, written there by the operator",
+			detailOr("at least one Pod does not carry the selector", "all instance Pods carry it", !stamped)))
+
+		msg, sawIt := failedSchedulingSaying(ctx, k3d, server, "didn't match Pod's node affinity/selector")
+		checks = append(checks, boolCheck(sawIt,
+			"The scheduler refused a Pod for not matching it",
+			detailOr("no FailedScheduling event blames the node selector", msg, !sawIt)))
+		checks = append(checks, boolCheck(healthy && runningCount(pods) == 3,
+			"All 3 instances are Running again and the cluster is healthy", placement))
+		return finish(checks), nil
+
+	case "required-anti-affinity":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(affinity.PodAntiAffinityType == "required",
+			"Anti-affinity is a requirement now, not a preference",
+			detailOr("podAntiAffinityType is "+affinity.PodAntiAffinityType,
+				"podAntiAffinityType: required", affinity.PodAntiAffinityType != "required")))
+
+		msg, sawIt := failedSchedulingSaying(ctx, k3d, server, "didn't match pod anti-affinity rules")
+		checks = append(checks, boolCheck(sawIt,
+			"The scheduler refused a Pod for not matching pod anti-affinity rules",
+			detailOr("no FailedScheduling event blames the anti-affinity rule", msg, !sawIt)))
+		checks = append(checks, boolCheck(affinity.TopologyKey == "kubernetes.io/hostname",
+			"The topology key is back to kubernetes.io/hostname",
+			detailOr("topologyKey is "+affinity.TopologyKey, affinity.TopologyKey,
+				affinity.TopologyKey != "kubernetes.io/hostname")))
+		checks = append(checks, boolCheck(healthy && nodesUsed(pods) == 3,
+			"All 3 instances are Running again, one per node", placement))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-node-selector", taskID)
+}
+
+/* ---- Lab 45: PodSpec Drift Detection ---- */
+
+// recordedPodSpec parses the cnpg.io/podSpec annotation — the operator's own record of the
+// Pod it generated, and the thing it compares against to decide a Pod has drifted.
+type recordedPodSpec struct {
+	TerminationGracePeriodSeconds *int `json:"terminationGracePeriodSeconds"`
+	Containers                    []struct {
+		Name      string `json:"name"`
+		Resources struct {
+			Requests map[string]string `json:"requests"`
+			Limits   map[string]string `json:"limits"`
+		} `json:"resources"`
+	} `json:"containers"`
+}
+
+func recordedSpecOf(p instancePod) (recordedPodSpec, bool) {
+	raw := p.Metadata.Annotations["cnpg.io/podSpec"]
+	if raw == "" {
+		return recordedPodSpec{}, false
+	}
+	var spec recordedPodSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		return recordedPodSpec{}, false
+	}
+	return spec, len(spec.Containers) > 0
+}
+
+func (r recordedPodSpec) requestedMemory() string {
+	for _, c := range r.Containers {
+		if c.Name == "postgres" {
+			return c.Resources.Requests["memory"]
+		}
+	}
+	return ""
+}
+
+func checkPodSpecDrift(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const wantMemory = "512Mi"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods, err := readInstancePods(ctx, k3d, server, cluster)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+
+	switch taskID {
+	case "read-the-record":
+		var checks []CheckItem
+		recorded, grace := 0, 0
+		for _, p := range pods {
+			if spec, ok := recordedSpecOf(p); ok {
+				recorded++
+				if spec.TerminationGracePeriodSeconds != nil {
+					grace = *spec.TerminationGracePeriodSeconds
+				}
+			}
+		}
+		checks = append(checks, boolCheck(recorded == 3,
+			"All 3 instance Pods carry the cnpg.io/podSpec annotation",
+			fmt.Sprintf("%d of %d Pods have a readable recorded spec", recorded, len(pods))))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/grace-period.txt")
+		if !found {
+			checks = append(checks, noItem("/root/grace-period.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/grace-period.txt was written", "found"))
+		want := strconv.Itoa(grace)
+		checks = append(checks, boolCheck(grace > 0 && strings.Contains(body, want),
+			"It names the shutdown grace period the operator recorded",
+			fmt.Sprintf("file says %q, the recorded spec says %s", firstLine(body), want)))
+		return finish(checks), nil
+
+	case "cause-drift":
+		var spec struct {
+			Spec struct {
+				Resources struct {
+					Requests map[string]string `json:"requests"`
+					Limits   map[string]string `json:"limits"`
+				} `json:"resources"`
+			} `json:"spec"`
+		}
+		if err := kubectlJSON(ctx, k3d, server, &spec, "get", "cluster.postgresql.cnpg.io", cluster); err != nil {
+			return CheckResult{}, err
+		}
+		asked := spec.Spec.Resources.Requests["memory"]
+
+		live, recorded := 0, 0
+		for _, p := range pods {
+			if p.requestedMemory() == wantMemory {
+				live++
+			}
+			if rec, ok := recordedSpecOf(p); ok && rec.requestedMemory() == wantMemory {
+				recorded++
+			}
+		}
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(asked == wantMemory,
+			"The Cluster asks for "+wantMemory+" of memory",
+			detailOr("spec.resources.requests.memory is "+detailOr("unset", asked, asked == ""), asked, asked != wantMemory)))
+		checks = append(checks, boolCheck(live == 3,
+			"All 3 instance Pods are running with it",
+			fmt.Sprintf("%d of %d Pods request %s", live, len(pods), wantMemory)))
+		checks = append(checks, boolCheck(recorded == 3,
+			"The recorded podSpec was rewritten to match",
+			fmt.Sprintf("%d of %d recorded specs request %s", recorded, len(pods), wantMemory)))
+		// The rollout replaces every Pod, primary included — but it does not hand the role to
+		// somebody else, which is what "restarted without a switchover" in the phase means.
+		same := a.baselinePrimary() != "" && c.Status.CurrentPrimary == a.baselinePrimary()
+		checks = append(checks, boolCheck(same && healthy,
+			"The same instance is still primary — the roll never switched over",
+			fmt.Sprintf("primary is %s, was %s; %s", c.Status.CurrentPrimary, a.baselinePrimary(), c.Status.Phase)))
+		return finish(checks), nil
+
+	case "tamper":
+		primary, ok := instanceByName(pods, c.Status.CurrentPrimary)
+		rebuilt, rebuiltName := false, ""
+		for _, p := range pods {
+			if !ok || p.Metadata.Name == primary.Metadata.Name {
+				continue
+			}
+			if p.Metadata.CreationTimestamp.After(primary.Metadata.CreationTimestamp) {
+				rebuilt, rebuiltName = true, p.Metadata.Name
+			}
+		}
+		restored := 0
+		for _, p := range pods {
+			if _, ok := recordedSpecOf(p); ok {
+				restored++
+			}
+		}
+
+		var checks []CheckItem
+		// The roll in the previous objective left the primary's Pod the youngest of the three,
+		// so a replica younger than it can only have been rebuilt afterwards.
+		checks = append(checks, boolCheck(rebuilt,
+			"The replica you tampered with was rebuilt",
+			detailOr("no replica Pod is younger than the primary's", rebuiltName+" is younger than "+c.Status.CurrentPrimary, !rebuilt)))
+		checks = append(checks, boolCheck(restored == 3,
+			"Its cnpg.io/podSpec annotation is a generated Pod spec again",
+			fmt.Sprintf("%d of %d Pods carry a readable recorded spec", restored, len(pods))))
+		checks = append(checks, boolCheck(healthy,
+			"The cluster is healthy, with all 3 instances back",
+			fmt.Sprintf("%s, %d/3 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-podspec-drift", taskID)
+}
+
+/* ---- Lab 46: In-Place Instance Manager Upgrades ---- */
+
+// operatorState is the three facts the in-place upgrade lab keeps comparing: which version
+// the operator Deployment runs, whether it is serving, and when its Pod started — the last
+// of which is the reference point for "the instances were never recreated".
+type operatorState struct {
+	image     string
+	version   string
+	available bool
+	podStart  time.Time
+}
+
+func readOperatorState(ctx context.Context, k3d *K3D, server string) operatorState {
+	var st operatorState
+	var deploy struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Image string `json:"image"`
+					} `json:"containers"`
+				} `json:"spec"`
+			} `json:"template"`
+		} `json:"spec"`
+		Status struct {
+			ReadyReplicas int `json:"readyReplicas"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &deploy, "-n", cnpgNamespace, "get", "deploy", cnpgOperatorDeploy); err == nil {
+		if len(deploy.Spec.Template.Spec.Containers) > 0 {
+			st.image = deploy.Spec.Template.Spec.Containers[0].Image
+			if i := strings.LastIndex(st.image, ":"); i >= 0 {
+				st.version = st.image[i+1:]
+			}
+		}
+		st.available = deploy.Status.ReadyReplicas >= 1
+	}
+	var pods struct {
+		Items []struct {
+			Metadata struct {
+				CreationTimestamp time.Time `json:"creationTimestamp"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &pods, "-n", cnpgNamespace, "get", "pods",
+		"-l", "app.kubernetes.io/name=cloudnative-pg"); err == nil {
+		for _, p := range pods.Items {
+			if p.Metadata.CreationTimestamp.After(st.podStart) {
+				st.podStart = p.Metadata.CreationTimestamp
+			}
+		}
+	}
+	return st
+}
+
+// instanceVersions counts how many instance Pods report version v in the annotation the
+// operator stamps on them, cnpg.io/operatorVersion.
+func instanceVersions(pods []instancePod, v string) (int, string) {
+	n := 0
+	var seen []string
+	for _, p := range pods {
+		got := p.Metadata.Annotations["cnpg.io/operatorVersion"]
+		if got == v {
+			n++
+		}
+		seen = append(seen, p.Metadata.Name+"="+detailOr("(none)", got, got == ""))
+	}
+	return n, strings.Join(seen, " ")
+}
+
+func checkInPlaceUpgrade(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods, err := readInstancePods(ctx, k3d, server, cluster)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	op := readOperatorState(ctx, k3d, server)
+
+	// Every instance Pod older than the operator's own Pod is the proof that an operator
+	// change did not take the database with it.
+	untouched, oldest := true, 0
+	for _, p := range pods {
+		if !op.podStart.IsZero() && p.Metadata.CreationTimestamp.Before(op.podStart) {
+			oldest++
+		} else {
+			untouched = false
+		}
+	}
+	untouched = untouched && len(pods) == 3
+	survivedDetail := fmt.Sprintf("%d of %d instance Pods predate the current operator Pod", oldest, len(pods))
+
+	switch taskID {
+	case "record-the-version":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(op.version == cnpgPreviousVersion,
+			"The operator is running v"+cnpgPreviousVersion,
+			detailOr("operator image is "+op.image, op.image, op.version != cnpgPreviousVersion)))
+		n, detail := instanceVersions(pods, cnpgPreviousVersion)
+		checks = append(checks, boolCheck(n == 3,
+			"All 3 instances report the same version in cnpg.io/operatorVersion", detail))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/before.txt")
+		if !found {
+			checks = append(checks, noItem("/root/before.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/before.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, cnpgPreviousVersion),
+			"It names the version the instances report",
+			fmt.Sprintf("file says %q", firstLine(body))))
+		return finish(checks), nil
+
+	case "enable-in-place":
+		// The key is INPLACE, not IN_PLACE. Spelling it the other way is accepted silently —
+		// the ConfigMap is read, the unknown key ignored, and the operator logs the setting
+		// still false — which is why the lab has the learner read it back out of the log.
+		var cm struct {
+			Metadata struct {
+				CreationTimestamp time.Time `json:"creationTimestamp"`
+			} `json:"metadata"`
+			Data map[string]string `json:"data"`
+		}
+		cmErr := kubectlJSON(ctx, k3d, server, &cm, "-n", cnpgNamespace, "get", "configmap", "cnpg-controller-manager-config")
+		flag := strings.ToLower(strings.TrimSpace(cm.Data["ENABLE_INSTANCE_MANAGER_INPLACE_UPDATES"]))
+		// Not-before rather than after: Kubernetes creation timestamps have one-second
+		// resolution, and creating the ConfigMap and restarting the operator in the same
+		// command lands both in the same second — which is exactly what the lab's own
+		// instructions do.
+		readIt := cmErr == nil && !cm.Metadata.CreationTimestamp.IsZero() &&
+			!op.podStart.IsZero() && !op.podStart.Before(cm.Metadata.CreationTimestamp)
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(flag == "true",
+			"The operator ConfigMap switches in-place instance manager updates on",
+			detailOr("ENABLE_INSTANCE_MANAGER_INPLACE_UPDATES is "+detailOr("absent", flag, flag == ""),
+				"ENABLE_INSTANCE_MANAGER_INPLACE_UPDATES=true", flag != "true")))
+		checks = append(checks, boolCheck(readIt,
+			"And the operator has restarted since, so it has read it",
+			detailOr("the operator Pod is older than the ConfigMap — it is still running on the old configuration",
+				"operator Pod started after the ConfigMap was created", !readIt)))
+		n, detail := instanceVersions(pods, cnpgPreviousVersion)
+		checks = append(checks, boolCheck(n == 3,
+			"The database is untouched and still reports v"+cnpgPreviousVersion, detail))
+		return finish(checks), nil
+
+	case "upgrade-in-place":
+		restarted := 0
+		for _, p := range pods {
+			restarted += p.restarts()
+		}
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(op.version == cnpgVersion && op.available,
+			"The operator is now v"+cnpgVersion+" and serving",
+			fmt.Sprintf("%s, ready=%v", op.image, op.available)))
+		n, detail := instanceVersions(pods, cnpgVersion)
+		checks = append(checks, boolCheck(n == 3,
+			"Every instance reports v"+cnpgVersion+" too", detail))
+		checks = append(checks, boolCheck(untouched && restarted == 0,
+			"Without a single Pod being recreated or a container restarted",
+			survivedDetail+fmt.Sprintf(", %d container restarts", restarted)))
+		checks = append(checks, boolCheck(c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3,
+			"And the cluster never left its healthy state",
+			fmt.Sprintf("%s, %d/3 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-in-place-upgrade", taskID)
+}
+
+/* ---- Lab 47: Multi-Arch Images ---- */
+
+// nodeArchitecture is what every check in the multi-arch lab compares against: the
+// architecture the nodes report, which is whatever the machine running this lab is.
+func nodeArchitecture(ctx context.Context, k3d *K3D, server string) (string, int, int) {
+	var nl struct {
+		Items []struct {
+			Status struct {
+				NodeInfo struct {
+					Architecture string `json:"architecture"`
+				} `json:"nodeInfo"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &nl, "get", "nodes"); err != nil {
+		return "", 0, 0
+	}
+	counts := map[string]int{}
+	for _, n := range nl.Items {
+		counts[n.Status.NodeInfo.Architecture]++
+	}
+	best, n := "", 0
+	for arch, c := range counts {
+		if c > n {
+			best, n = arch, c
+		}
+	}
+	return best, n, len(nl.Items)
+}
+
+func checkMultiArch(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	arch, same, total := nodeArchitecture(ctx, k3d, server)
+
+	switch taskID {
+	case "what-you-run":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(arch != "" && same == total && total == 3,
+			"All 3 nodes report the same architecture",
+			fmt.Sprintf("%d of %d nodes are %s", same, total, detailOr("unknown", arch, arch == ""))))
+
+		reported, ok := execInPod(ctx, docker, server, "pg-cluster-1", "dpkg", "--print-architecture")
+		checks = append(checks, boolCheck(ok && reported == arch,
+			"The PostgreSQL image running on them reports it too",
+			fmt.Sprintf("the container says %q, the nodes say %q", reported, arch)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/arch.txt")
+		if !found {
+			checks = append(checks, noItem("/root/arch.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/arch.txt was written", "found"))
+		checks = append(checks, boolCheck(arch != "" && strings.Contains(body, arch),
+			"It names your nodes' architecture",
+			fmt.Sprintf("file says %q, the nodes are %q", firstLine(body), arch)))
+		return finish(checks), nil
+
+	case "ask-the-registry":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/image-digest.txt")
+		if !found {
+			checks = append(checks, noItem("/root/image-digest.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/image-digest.txt was written", "found"))
+		digest := firstLine(body)
+
+		// The same walk the learner did, done server-side: a digest is only worth anything if
+		// the registry really publishes it for this tag.
+		platforms, err := indexPlatforms(ctx, cnpgPostgresImage)
+		if err != nil {
+			checks = append(checks, noItem("It is a digest the registry publishes for this tag", "could not read the registry: "+err.Error()))
+			checks = append(checks, noItem("And it is the one built for your architecture", "not checked"))
+			return finish(checks), nil
+		}
+		known := false
+		for _, d := range platforms {
+			if d == digest {
+				known = true
+			}
+		}
+		checks = append(checks, boolCheck(known,
+			"It is a digest the registry publishes for this tag",
+			fmt.Sprintf("file says %q; the index lists %d linux platforms", digest, len(platforms))))
+		checks = append(checks, boolCheck(digest != "" && digest == platforms[arch],
+			"And it is the one built for your architecture",
+			fmt.Sprintf("linux/%s is %s", arch, platforms[arch])))
+		return finish(checks), nil
+
+	case "follow-the-digest":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/config-digest.txt")
+		if !found {
+			checks = append(checks, noItem("/root/config-digest.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/config-digest.txt was written", "found"))
+		recorded := firstLine(body)
+
+		platforms, err := indexPlatforms(ctx, cnpgPostgresImage)
+		if err != nil {
+			checks = append(checks, noItem("The manifest for your architecture names it as its config blob", "could not read the registry: "+err.Error()))
+			checks = append(checks, noItem("And that blob says the image was built for your architecture", "not checked"))
+			return finish(checks), nil
+		}
+		config, err := manifestConfigDigest(ctx, cnpgPostgresImage, platforms[arch])
+		if err != nil {
+			checks = append(checks, noItem("The manifest for your architecture names it as its config blob", "could not read the manifest: "+err.Error()))
+			checks = append(checks, noItem("And that blob says the image was built for your architecture", "not checked"))
+			return finish(checks), nil
+		}
+		checks = append(checks, boolCheck(recorded == config,
+			"The manifest for your architecture names it as its config blob",
+			fmt.Sprintf("file says %q, the manifest names %q", recorded, config)))
+
+		blobArch, blobOS, err := blobPlatform(ctx, cnpgPostgresImage, config)
+		checks = append(checks, boolCheck(err == nil && blobArch == arch && blobOS == "linux",
+			"And that blob says the image was built for your architecture",
+			fmt.Sprintf("the config blob says %s/%s, the nodes are linux/%s", blobOS, blobArch, arch)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-multi-arch", taskID)
+}
+
+/* ---- Lab 48: Cluster Labels and Annotations ---- */
+
+// inheritedMetadata is spec.inheritedMetadata: labels and annotations the operator copies
+// onto every object it generates for this Cluster.
+type inheritedMetadata struct {
+	Labels      map[string]string `json:"labels"`
+	Annotations map[string]string `json:"annotations"`
+}
+
+func readInheritedMetadata(ctx context.Context, k3d *K3D, server, cluster string) inheritedMetadata {
+	var c struct {
+		Spec struct {
+			InheritedMetadata inheritedMetadata `json:"inheritedMetadata"`
+		} `json:"spec"`
+	}
+	_ = kubectlJSON(ctx, k3d, server, &c, "get", "cluster.postgresql.cnpg.io", cluster)
+	return c.Spec.InheritedMetadata
+}
+
+func checkInheritedMetadata(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const selector = "cnpg.io/cluster=pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	inherited := readInheritedMetadata(ctx, k3d, server, cluster)
+	pods := readMeta(ctx, k3d, server, "pods", "-l", "cnpg.io/podRole=instance,"+selector)
+	claims := readMeta(ctx, k3d, server, "pvc", "-l", selector)
+	services := readMeta(ctx, k3d, server, "svc", "-l", selector)
+	// By selector, not by name: `kubectl get secret <name> -o json` returns the object rather
+	// than a List, so metaList.Items would come back empty and every check over it would fail
+	// with a confusing "0 of 0".
+	secrets := readMeta(ctx, k3d, server, "secret", "-l", selector)
+
+	switch taskID {
+	case "inherit-them":
+		team := inherited.Labels["team"]
+		centre := inherited.Labels["cost-centre"]
+		owner := inherited.Annotations["owner"]
+
+		podsLabelled, podCount := pods.everyItemHasLabel("team", team)
+		podsAnnotated, podAnnCount := pods.everyItemHasAnnotation("owner", owner)
+		claimsLabelled, claimCount := claims.everyItemHasLabel("team", team)
+		svcLabelled, svcCount := services.everyItemHasLabel("team", team)
+		secretLabelled, secretCount := secrets.everyItemHasLabel("team", team)
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(team != "" && centre != "" && owner != "",
+			"The Cluster asks for two labels and an annotation to be inherited",
+			fmt.Sprintf("labels %v, annotations %v", inherited.Labels, inherited.Annotations)))
+		checks = append(checks, boolCheck(team != "" && podsLabelled && podsAnnotated,
+			"All 3 instance Pods carry both",
+			fmt.Sprintf("%d of %d Pods have the label, %d have the annotation", podCount, len(pods.Items), podAnnCount)))
+		checks = append(checks, boolCheck(team != "" && claimsLabelled,
+			"So do their PersistentVolumeClaims",
+			fmt.Sprintf("%d of %d claims", claimCount, len(claims.Items))))
+		checks = append(checks, boolCheck(team != "" && svcLabelled && secretLabelled,
+			"And the Services and the application Secret the operator generated",
+			fmt.Sprintf("%d of %d Services, %d of %d Secrets", svcCount, len(services.Items), secretCount, len(secrets.Items))))
+		return finish(checks), nil
+
+	case "change-and-remove":
+		_, stillInSpec := inherited.Labels["cost-centre"]
+		team := inherited.Labels["team"]
+		kept, keptCount := pods.everyItemHasLabel("cost-centre", "cc-4471")
+		followed, followedCount := pods.everyItemHasLabel("team", team)
+		claimsFollowed, claimsCount := claims.everyItemHasLabel("team", team)
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(!stillInSpec,
+			"The Cluster no longer asks for cost-centre to be inherited",
+			detailOr("spec.inheritedMetadata.labels still names it", "removed from the spec", stillInSpec)))
+		checks = append(checks, boolCheck(kept,
+			"The Pods still carry it — nothing takes an inherited label back",
+			fmt.Sprintf("%d of %d Pods still labelled cost-centre=cc-4471", keptCount, len(pods.Items))))
+		checks = append(checks, boolCheck(team != "" && followed && claimsFollowed,
+			"While the team label's new value reached every Pod and claim",
+			fmt.Sprintf("team=%s on %d of %d Pods and %d of %d claims", team, followedCount, len(pods.Items), claimsCount, len(claims.Items))))
+		return finish(checks), nil
+
+	case "override-what-the-operator-owns":
+		_, stillOverridden := inherited.Labels["cnpg.io/instanceRole"]
+		primaries := 0
+		primaryName := ""
+		for _, p := range pods.Items {
+			if p.Metadata.Labels["cnpg.io/instanceRole"] == "primary" {
+				primaries++
+				primaryName = p.Metadata.Name
+			}
+		}
+		ips, _ := serviceEndpointIPs(ctx, k3d, server, cluster+"-rw")
+
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/readonly-error.txt")
+		if !found {
+			checks = append(checks, noItem("/root/readonly-error.txt was written", "file not found on any node"))
+		} else {
+			checks = append(checks, boolCheck(strings.Contains(body, "read-only transaction"),
+				"/root/readonly-error.txt was written",
+				fmt.Sprintf("file says %q", firstLine(body))))
+		}
+		checks = append(checks, boolCheck(!stillOverridden,
+			"The Cluster no longer inherits cnpg.io/instanceRole",
+			detailOr("spec.inheritedMetadata.labels still overrides it", "the override is gone", stillOverridden)))
+		checks = append(checks, boolCheck(primaries == 1 && primaryName == c.Status.CurrentPrimary,
+			"Exactly one Pod is labelled primary, and it is the real one",
+			fmt.Sprintf("%d Pod(s) labelled primary, the cluster says %s", primaries, c.Status.CurrentPrimary)))
+		checks = append(checks, boolCheck(len(ips) == 1,
+			"The read-write Service is back to a single endpoint",
+			fmt.Sprintf("%d ready endpoint(s): %v", len(ips), ips)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-inherited-metadata", taskID)
+}
+
+/* ---- Lab 49: Object Metadata ---- */
+
+func checkObjectMetadata(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const selector = "cnpg.io/cluster=pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods := readMeta(ctx, k3d, server, "pods", "-l", "cnpg.io/podRole=instance,"+selector)
+	claims := readMeta(ctx, k3d, server, "pvc", "-l", selector)
+	services := readMeta(ctx, k3d, server, "svc", "-l", selector)
+	// By selector, not by name: `kubectl get secret <name> -o json` returns the object rather
+	// than a List, so metaList.Items would come back empty and every check over it would fail
+	// with a confusing "0 of 0".
+	secrets := readMeta(ctx, k3d, server, "secret", "-l", selector)
+
+	switch taskID {
+	case "one-selector":
+		podsOK, podCount := pods.everyItemHasLabel("cnpg.io/cluster", cluster)
+		claimsOK, claimCount := claims.everyItemHasLabel("cnpg.io/cluster", cluster)
+		svcOK, svcCount := services.everyItemHasLabel("cnpg.io/cluster", cluster)
+		secretOK, secretCount := secrets.everyItemHasLabel("cnpg.io/cluster", cluster)
+
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/cluster-label.txt")
+		if !found {
+			checks = append(checks, noItem("/root/cluster-label.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/cluster-label.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, "cnpg.io/cluster"),
+			"It names the label every generated object carries",
+			fmt.Sprintf("file says %q", firstLine(body))))
+		checks = append(checks, boolCheck(podsOK && claimsOK,
+			"The instance Pods and their claims all carry it",
+			fmt.Sprintf("%d of %d Pods, %d of %d claims", podCount, len(pods.Items), claimCount, len(claims.Items))))
+		checks = append(checks, boolCheck(svcOK && secretOK,
+			"So do the Services and the application Secret",
+			fmt.Sprintf("%d of %d Services, %d of %d Secrets", svcCount, len(services.Items), secretCount, len(secrets.Items))))
+		return finish(checks), nil
+
+	case "the-routing-table":
+		var svc struct {
+			Items []struct {
+				Metadata struct {
+					Name string `json:"name"`
+				} `json:"metadata"`
+				Spec struct {
+					Selector map[string]string `json:"selector"`
+				} `json:"spec"`
+			} `json:"items"`
+		}
+		_ = kubectlJSON(ctx, k3d, server, &svc, "get", "svc", "-l", selector)
+		rwSelector, roSelector := map[string]string{}, map[string]string{}
+		for _, s := range svc.Items {
+			switch s.Metadata.Name {
+			case cluster + "-rw":
+				rwSelector = s.Spec.Selector
+			case cluster + "-ro":
+				roSelector = s.Spec.Selector
+			}
+		}
+		rwIPs, _ := serviceEndpointIPs(ctx, k3d, server, cluster+"-rw")
+		roIPs, _ := serviceEndpointIPs(ctx, k3d, server, cluster+"-ro")
+
+		primaryIP := ""
+		instances, _ := readInstancePods(ctx, k3d, server, cluster)
+		if p, ok := instanceByName(instances, c.Status.CurrentPrimary); ok {
+			primaryIP = p.Status.PodIP
+		}
+
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/rw-selector.txt")
+		if !found {
+			checks = append(checks, noItem("/root/rw-selector.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/rw-selector.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, "cnpg.io/instanceRole") && strings.Contains(body, "primary"),
+			"It names the label the read-write Service selects on",
+			fmt.Sprintf("file says %q", firstLine(body))))
+		checks = append(checks, boolCheck(rwSelector["cnpg.io/instanceRole"] == "primary" &&
+			len(rwIPs) == 1 && primaryIP != "" && rwIPs[0] == primaryIP,
+			"The read-write Service resolves to exactly one Pod, the current primary",
+			fmt.Sprintf("selector %v, endpoints %v, primary %s is %s", rwSelector, rwIPs, c.Status.CurrentPrimary, primaryIP)))
+		checks = append(checks, boolCheck(roSelector["cnpg.io/instanceRole"] == "replica" && len(roIPs) == 2,
+			"And the read-only Service to the two replicas",
+			fmt.Sprintf("selector %v, %d endpoint(s)", roSelector, len(roIPs))))
+		return finish(checks), nil
+
+	case "who-owns-the-labels":
+		mine, minePod := false, ""
+		primaries, primaryName := 0, ""
+		for _, p := range pods.Items {
+			if p.Metadata.Labels["scratch"] == "mine" {
+				mine, minePod = true, p.Metadata.Name
+			}
+			if p.Metadata.Labels["cnpg.io/instanceRole"] == "primary" {
+				primaries++
+				primaryName = p.Metadata.Name
+			}
+		}
+		rwIPs, _ := serviceEndpointIPs(ctx, k3d, server, cluster+"-rw")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(mine,
+			"A label of your own is still on an instance Pod — the operator left it alone",
+			detailOr("no instance Pod carries scratch=mine", minePod+" carries scratch=mine", !mine)))
+		checks = append(checks, boolCheck(primaries == 1 && primaryName == c.Status.CurrentPrimary,
+			"But cnpg.io/instanceRole agrees with the operator again",
+			fmt.Sprintf("%d Pod(s) labelled primary, the cluster says %s", primaries, c.Status.CurrentPrimary)))
+		checks = append(checks, boolCheck(len(rwIPs) == 1,
+			"And the read-write Service still resolves to the primary alone",
+			fmt.Sprintf("%d ready endpoint(s): %v", len(rwIPs), rwIPs)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-object-metadata", taskID)
+}
+
+/* ---- Labs 50–53: corruption, cloning and importing ---- */
+
+// tableCount counts a table inside one instance, as the local superuser. It returns the whole
+// result rather than just the number, because several of the checks below are about the read
+// *failing* — a corrupt page is proved by the error, not by the count.
+func tableCount(ctx context.Context, docker *Docker, server, pod, db, table string) sqlResult {
+	res, err := psqlSuper(ctx, docker, server, pod, db, "SELECT count(*) FROM "+table+";")
+	if err != nil {
+		return sqlResult{stderr: err.Error(), code: -1}
+	}
+	return res
+}
+
+// countsOn reports the row count each of the named instances returns, and whether every one of
+// them answered with want.
+func countsOn(ctx context.Context, docker *Docker, server, db, table string, pods []string, want int) (bool, string) {
+	all := true
+	var parts []string
+	for _, p := range pods {
+		res := tableCount(ctx, docker, server, p, db, table)
+		if !res.ok() {
+			all = false
+			parts = append(parts, p+"=error")
+			continue
+		}
+		if res.count() != want {
+			all = false
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d", p, res.count()))
+	}
+	return all && len(pods) > 0, strings.Join(parts, " ")
+}
+
+// instanceNames lists a cluster's instance Pods by name.
+func instanceNames(ctx context.Context, k3d *K3D, server, cluster string) []string {
+	pods, err := readInstancePods(ctx, k3d, server, cluster)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range pods {
+		out = append(out, p.Metadata.Name)
+	}
+	return out
+}
+
+// pvcVolume is the PersistentVolume a claim is bound to — the only way to tell a rebuilt
+// instance from a restarted one, since the claim keeps its name either way.
+func pvcVolume(ctx context.Context, k3d *K3D, server, claim string) string {
+	res, err := k3d.Kubectl(ctx, server, "get", "pvc", claim, "-o", "jsonpath={.spec.volumeName}")
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	return strings.TrimSpace(res.Stdout)
+}
+
+func secretExists(ctx context.Context, k3d *K3D, server, name string) bool {
+	res, err := k3d.Kubectl(ctx, server, "get", "secret", name, "-o", "jsonpath={.metadata.name}")
+	return err == nil && res.ExitCode == 0 && strings.TrimSpace(res.Stdout) != ""
+}
+
+// psqlAsUser connects from the lab's client Pod as a named role with an explicit password —
+// which is how the import labs prove that a role's password did or did not come across.
+func psqlAsUser(ctx context.Context, docker *Docker, server, host, user, password, db, sql string) sqlResult {
+	res, err := runSQL(ctx, docker, server, []string{
+		"kubectl", "exec", "psql-client", "--",
+		"env", "PGPASSWORD=" + password,
+		"psql", "-h", host, "-U", user, "-d", db, "-tAc", sql,
+	})
+	if err != nil {
+		return sqlResult{stderr: err.Error(), code: -1}
+	}
+	return res
+}
+
+// databaseOwners maps database name to owner on one instance.
+func databaseOwners(ctx context.Context, docker *Docker, server, pod string) map[string]string {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres",
+		"SELECT datname || '|' || pg_get_userbyid(datdba) FROM pg_database WHERE datname NOT IN ('template0','template1');")
+	out := map[string]string{}
+	if err != nil || !res.ok() {
+		return out
+	}
+	for _, line := range strings.Split(res.stdout, "\n") {
+		name, owner := splitPipe(line)
+		if name != "" {
+			out[name] = owner
+		}
+	}
+	return out
+}
+
+// roleLogin maps role name to whether it may log in, for the roles a lab cares about.
+func roleLogin(ctx context.Context, docker *Docker, server, pod string) map[string]bool {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres",
+		"SELECT rolname || '|' || rolcanlogin FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%';")
+	out := map[string]bool{}
+	if err != nil || !res.ok() {
+		return out
+	}
+	for _, line := range strings.Split(res.stdout, "\n") {
+		name, canLogin := splitPipe(line)
+		if name != "" {
+			// Concatenating a boolean renders it as true/false, not as the t/f psql prints
+			// in a table — which is a difference worth being explicit about.
+			out[name] = strings.HasPrefix(canLogin, "t")
+		}
+	}
+	return out
+}
+
+/* ---- Lab 50: Data Corruption ---- */
+
+func checkDataCorruption(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods := instanceNames(ctx, k3d, server, cluster)
+	damaged := a.baselinePrimary() // the instance that was primary when the environment was built
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+
+	var others []string
+	for _, p := range pods {
+		if p != damaged {
+			others = append(others, p)
+		}
+	}
+
+	switch taskID {
+	case "find-the-page":
+		var checks []CheckItem
+		checksums, _ := pgSetting(ctx, docker, server, c.Status.CurrentPrimary, "data_checksums")
+		checks = append(checks, boolCheck(checksums == "on",
+			"Data checksums are on", "data_checksums is "+detailOr("unreadable", checksums, checksums == "")))
+
+		ok, detail := countsOn(ctx, docker, server, "app", "ledger", pods, 2000)
+		checks = append(checks, boolCheck(ok, "All 3 instances return every row of the ledger table", detail))
+
+		path, err := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", "SELECT pg_relation_filepath('ledger');")
+		want := ""
+		if err == nil && path.ok() {
+			want = strings.TrimSpace(path.stdout)
+		}
+		body, found := readFileAnyNode(ctx, docker, a, "/root/ledger-path.txt")
+		if !found {
+			checks = append(checks, noItem("/root/ledger-path.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/ledger-path.txt was written", "found"))
+		checks = append(checks, boolCheck(want != "" && strings.Contains(body, want),
+			"It names the file the table lives in",
+			fmt.Sprintf("file says %q, the table is in %q", firstLine(body), want)))
+		return finish(checks), nil
+
+	case "corrupt-and-count":
+		var checks []CheckItem
+		if damaged == "" {
+			return CheckResult{}, fmt.Errorf("this attempt has no baseline primary recorded")
+		}
+		// The read is the evidence. A page whose checksum does not match is refused outright,
+		// and the refusal names the block and the file.
+		read := tableCount(ctx, docker, server, damaged, "app", "ledger")
+		broke := !read.ok() && strings.Contains(read.stderr, "invalid page in block")
+		checks = append(checks, boolCheck(broke,
+			"The instance you damaged cannot read the block",
+			detailOr(fmt.Sprintf("%s answered %q", damaged, firstLine(detailOr(read.stdout, read.stderr, read.stderr != ""))),
+				firstLine(read.stderr), !broke)))
+
+		failures := 0
+		if res, err := psqlSuper(ctx, docker, server, damaged, "postgres",
+			"SELECT checksum_failures FROM pg_stat_database WHERE datname = 'app';"); err == nil {
+			failures = res.count()
+		}
+		checks = append(checks, boolCheck(failures > 0,
+			"Its checksum failure counter has recorded it",
+			fmt.Sprintf("pg_stat_database.checksum_failures is %d", failures)))
+
+		checks = append(checks, boolCheck(healthy,
+			"The cluster still reports healthy — nothing else noticed",
+			fmt.Sprintf("%s, %d/3 ready", c.Status.Phase, c.Status.ReadyInstances)))
+
+		ok, detail := countsOn(ctx, docker, server, "app", "ledger", others, 2000)
+		checks = append(checks, boolCheck(ok, "The other two instances still return every row", detail))
+		return finish(checks), nil
+
+	case "discard-the-copy":
+		var checks []CheckItem
+		moved := damaged != "" && c.Status.CurrentPrimary != damaged
+		checks = append(checks, boolCheck(moved,
+			"A different instance is primary now",
+			fmt.Sprintf("primary is %s, the damaged instance was %s", c.Status.CurrentPrimary, damaged)))
+
+		volume := pvcVolume(ctx, k3d, server, damaged)
+		replaced := volume != "" && a.baselineVolume() != "" && volume != a.baselineVolume()
+		checks = append(checks, boolCheck(replaced,
+			"The damaged instance is on a different volume",
+			fmt.Sprintf("%s is on %s, was on %s", damaged, detailOr("(gone)", volume, volume == ""), a.baselineVolume())))
+
+		checks = append(checks, boolCheck(healthy,
+			"All 3 instances are ready and the cluster is healthy",
+			fmt.Sprintf("%s, %d/3 ready", c.Status.Phase, c.Status.ReadyInstances)))
+
+		ok, detail := countsOn(ctx, docker, server, "app", "ledger", pods, 2000)
+		checks = append(checks, boolCheck(ok, "Every row is back, on all three instances", detail))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-data-corruption", taskID)
+}
+
+/* ---- Lab 51: Cloning with pg_basebackup ---- */
+
+func checkBasebackupClone(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const source = "pg-cluster"
+	const clone = "pg-clone"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	sourceHealthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	clonePhase, cloneReady, cloneExists := clusterPhase(ctx, k3d, server, clone)
+	cloneHealthy := cloneExists && clonePhase == "Cluster in healthy state" && cloneReady == 1
+
+	switch taskID {
+	case "read-the-source":
+		var checks []CheckItem
+		res := tableCount(ctx, docker, server, c.Status.CurrentPrimary, "app", "notes")
+		checks = append(checks, boolCheck(sourceHealthy && res.ok() && res.count() == 50,
+			"The source is healthy and the notes table has 50 rows",
+			fmt.Sprintf("%s, %d/3 ready, %d rows", c.Status.Phase, c.Status.ReadyInstances, res.count())))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/source-rows.txt")
+		if !found {
+			checks = append(checks, noItem("/root/source-rows.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/source-rows.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, "50"),
+			"It records the row count you read", fmt.Sprintf("file says %q", firstLine(body))))
+		return finish(checks), nil
+
+	case "clone-it":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(cloneHealthy,
+			"A second Cluster named pg-clone reports healthy",
+			detailOr("pg-clone does not exist yet", clonePhase+fmt.Sprintf(", %d/1 ready", cloneReady), !cloneExists)))
+
+		recovery, _ := psqlSuper(ctx, docker, server, clone+"-1", "postgres", "SELECT pg_is_in_recovery();")
+		standing := strings.TrimSpace(recovery.stdout) == "f"
+		checks = append(checks, boolCheck(standing,
+			"It is a read-write primary, not a standby",
+			fmt.Sprintf("pg_is_in_recovery() is %q", strings.TrimSpace(recovery.stdout))))
+
+		rows := tableCount(ctx, docker, server, clone+"-1", "app", "notes")
+		checks = append(checks, boolCheck(rows.ok() && rows.count() == 50,
+			"It carries the 50 rows the source had when the copy was taken",
+			fmt.Sprintf("%d rows on the clone", rows.count())))
+
+		// A physical copy brings the source's roles, passwords included — and then the
+		// operator resets the application user to the credentials it manages for this new
+		// cluster, so the password that worked a minute ago on the source does not work here.
+		sourcePassword, err := appPassword(ctx, k3d, server, source)
+		refused := false
+		detail := "could not read the source's app secret"
+		if err == nil {
+			try := psqlAsUser(ctx, docker, server, clone+"-rw", "app", sourcePassword, "app", "SELECT 1;")
+			refused = !try.ok() && strings.Contains(try.stderr, "password authentication failed")
+			detail = detailOr("the source's password still works on the clone", firstLine(try.stderr), !refused)
+		}
+		checks = append(checks, boolCheck(refused,
+			"And its own application credentials — the source password is refused", detail))
+		return finish(checks), nil
+
+	case "prove-independence":
+		var checks []CheckItem
+		onClone, _ := psqlSuper(ctx, docker, server, clone+"-1", "app",
+			"SELECT count(*) FROM notes WHERE entry LIKE '%clone%';")
+		onSource, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app",
+			"SELECT count(*) FROM notes WHERE entry LIKE '%clone%';")
+		checks = append(checks, boolCheck(onClone.count() > 0 && onSource.count() == 0,
+			"The row you wrote on the clone is not on the source",
+			fmt.Sprintf("%d on the clone, %d on the source", onClone.count(), onSource.count())))
+
+		srcRow, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app",
+			"SELECT count(*) FROM notes WHERE entry LIKE '%source%';")
+		cloneRow, _ := psqlSuper(ctx, docker, server, clone+"-1", "app",
+			"SELECT count(*) FROM notes WHERE entry LIKE '%source%';")
+		checks = append(checks, boolCheck(srcRow.count() > 0 && cloneRow.count() == 0,
+			"The row you wrote on the source is not on the clone",
+			fmt.Sprintf("%d on the source, %d on the clone", srcRow.count(), cloneRow.count())))
+
+		receiver, _ := psqlSuper(ctx, docker, server, clone+"-1", "postgres", "SELECT count(*) FROM pg_stat_wal_receiver;")
+		senders, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "postgres",
+			"SELECT count(*) FROM pg_stat_replication WHERE application_name = 'pg-clone';")
+		checks = append(checks, boolCheck(receiver.count() == 0 && senders.count() == 0,
+			"Neither one is replicating to the other",
+			fmt.Sprintf("%d WAL receiver(s) on the clone, %d sender(s) for it on the source", receiver.count(), senders.count())))
+
+		checks = append(checks, boolCheck(sourceHealthy && cloneHealthy,
+			"Both clusters are healthy",
+			fmt.Sprintf("source: %s; clone: %s", c.Status.Phase, clonePhase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-basebackup-clone", taskID)
+}
+
+/* ---- Lab 52: Importing one database (microservice) ---- */
+
+func checkImportMicroservice(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const target = "pg-orders"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	sourcePrimary := c.Status.CurrentPrimary
+	sourceHealthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	targetPhase, targetReady, targetExists := clusterPhase(ctx, k3d, server, target)
+	targetHealthy := targetExists && targetPhase == "Cluster in healthy state" && targetReady == 1
+
+	switch taskID {
+	case "survey-the-source":
+		var checks []CheckItem
+		dbs := databaseOwners(ctx, docker, server, sourcePrimary)
+		_, hasOrders := dbs["orders"]
+		_, hasBilling := dbs["billing"]
+		checks = append(checks, boolCheck(hasOrders && hasBilling,
+			"The source server carries the orders and billing databases",
+			fmt.Sprintf("databases: %s", strings.Join(sortedKeysOf(dbs), ", "))))
+
+		rows := tableCount(ctx, docker, server, sourcePrimary, "orders", "lines")
+		checks = append(checks, boolCheck(rows.ok() && rows.count() == 500,
+			"The orders database has 500 rows in lines", fmt.Sprintf("%d rows", rows.count())))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/orders-rows.txt")
+		if !found {
+			checks = append(checks, noItem("/root/orders-rows.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/orders-rows.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, "500"),
+			"It records that row count", fmt.Sprintf("file says %q", firstLine(body))))
+		return finish(checks), nil
+
+	case "import-it":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(targetHealthy,
+			"A new Cluster named pg-orders reports healthy",
+			detailOr("pg-orders does not exist yet", targetPhase+fmt.Sprintf(", %d/1 ready", targetReady), !targetExists)))
+
+		rows := tableCount(ctx, docker, server, target+"-1", "app", "lines")
+		checks = append(checks, boolCheck(rows.ok() && rows.count() == 500,
+			"Its application database holds the imported table, with all 500 rows",
+			fmt.Sprintf("%d rows in the app database", rows.count())))
+
+		owner, _ := psqlSuper(ctx, docker, server, target+"-1", "app",
+			"SELECT tableowner FROM pg_tables WHERE tablename = 'lines';")
+		got := strings.TrimSpace(owner.stdout)
+		checks = append(checks, boolCheck(got == "app",
+			"And it belongs to the new cluster's application user",
+			fmt.Sprintf("lines is owned by %q", got)))
+
+		src := tableCount(ctx, docker, server, sourcePrimary, "orders", "lines")
+		checks = append(checks, boolCheck(sourceHealthy && src.ok() && src.count() >= 500,
+			"The source is untouched and still serving",
+			fmt.Sprintf("%s, orders.lines has %d rows", c.Status.Phase, src.count())))
+		return finish(checks), nil
+
+	case "what-it-left-behind":
+		var checks []CheckItem
+		roles := roleLogin(ctx, docker, server, target+"-1")
+		_, hasShop := roles["shop"]
+		checks = append(checks, boolCheck(!hasShop,
+			"The imported cluster has no shop role — a microservice import brings no roles",
+			fmt.Sprintf("roles: %s", strings.Join(sortedKeysOf(roles), ", "))))
+
+		dbs := databaseOwners(ctx, docker, server, target+"-1")
+		_, hasOrders := dbs["orders"]
+		_, hasApp := dbs["app"]
+		checks = append(checks, boolCheck(!hasOrders && hasApp,
+			"And no database called orders — it arrived as app",
+			fmt.Sprintf("databases: %s", strings.Join(sortedKeysOf(dbs), ", "))))
+
+		src := tableCount(ctx, docker, server, sourcePrimary, "orders", "lines")
+		dst := tableCount(ctx, docker, server, target+"-1", "app", "lines")
+		diverged := src.ok() && dst.ok() && src.count() > dst.count()
+		checks = append(checks, boolCheck(diverged,
+			"A row written on the source after the import never reached it",
+			fmt.Sprintf("source has %d rows, the imported cluster has %d", src.count(), dst.count())))
+
+		checks = append(checks, boolCheck(sourceHealthy && targetHealthy,
+			"Both clusters are healthy",
+			fmt.Sprintf("source: %s; imported: %s", c.Status.Phase, targetPhase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-import-microservice", taskID)
+}
+
+/* ---- Lab 53: Importing a whole server (monolith) ---- */
+
+func checkImportMonolith(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const target = "pg-estate"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	sourcePrimary := c.Status.CurrentPrimary
+	sourceHealthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	targetPhase, targetReady, targetExists := clusterPhase(ctx, k3d, server, target)
+	targetHealthy := targetExists && targetPhase == "Cluster in healthy state" && targetReady == 1
+
+	switch taskID {
+	case "survey-the-server":
+		var checks []CheckItem
+		dbs := databaseOwners(ctx, docker, server, sourcePrimary)
+		haveAll := dbs["orders"] == "shop" && dbs["billing"] == "shop" && dbs["app"] == "app"
+		checks = append(checks, boolCheck(haveAll,
+			"The server carries three application databases, with two owners between them",
+			fmt.Sprintf("%v", dbs)))
+
+		roles := roleLogin(ctx, docker, server, sourcePrimary)
+		shop, hasShop := roles["shop"]
+		reporting, hasReporting := roles["reporting"]
+		checks = append(checks, boolCheck(hasShop && shop && hasReporting && !reporting,
+			"And the roles that own them, including one that cannot log in",
+			fmt.Sprintf("shop can log in: %v; reporting can log in: %v", shop, reporting)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/databases.txt")
+		if !found {
+			checks = append(checks, noItem("/root/databases.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/databases.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, "orders") && strings.Contains(body, "billing"),
+			"It lists the databases you are about to move",
+			fmt.Sprintf("file names orders: %v, billing: %v",
+				strings.Contains(body, "orders"), strings.Contains(body, "billing"))))
+		return finish(checks), nil
+
+	case "import-everything":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(targetHealthy,
+			"A new Cluster named pg-estate reports healthy",
+			detailOr("pg-estate does not exist yet", targetPhase+fmt.Sprintf(", %d/1 ready", targetReady), !targetExists)))
+
+		dbs := databaseOwners(ctx, docker, server, target+"-1")
+		kept := dbs["orders"] == "shop" && dbs["billing"] == "shop"
+		checks = append(checks, boolCheck(kept,
+			"It has the same databases, with the same names and owners",
+			fmt.Sprintf("%v", dbs)))
+
+		roles := roleLogin(ctx, docker, server, target+"-1")
+		shop, hasShop := roles["shop"]
+		reporting, hasReporting := roles["reporting"]
+		checks = append(checks, boolCheck(hasShop && shop && hasReporting && !reporting,
+			"And the roles, including the one that cannot log in",
+			fmt.Sprintf("shop: %v (login %v), reporting: %v (login %v)", hasShop, shop, hasReporting, reporting)))
+
+		lines := tableCount(ctx, docker, server, target+"-1", "orders", "lines")
+		invoices := tableCount(ctx, docker, server, target+"-1", "billing", "invoices")
+		checks = append(checks, boolCheck(lines.count() == 500 && invoices.count() == 200,
+			"The data came with them — 500 order lines and 200 invoices",
+			fmt.Sprintf("orders.lines=%d billing.invoices=%d", lines.count(), invoices.count())))
+		return finish(checks), nil
+
+	case "what-you-own-now":
+		var checks []CheckItem
+		// pg_dumpall --roles-only carries the password hashes, so a login role that worked on
+		// the source works here — which is convenient and worth knowing before you assume
+		// otherwise during a cutover.
+		try := psqlAsUser(ctx, docker, server, target+"-rw", "shop", "shop_pw", "orders", "SELECT count(*) FROM lines;")
+		checks = append(checks, boolCheck(try.ok() && try.count() == 500,
+			"The imported roles kept their passwords — shop still logs in with the old one",
+			detailOr(firstLine(try.stderr), fmt.Sprintf("read %d rows as shop", try.count()), !try.ok())))
+
+		checks = append(checks, boolCheck(!secretExists(ctx, k3d, server, target+"-app"),
+			"The operator created no application user for this cluster",
+			detailOr("a "+target+"-app Secret exists", "there is no "+target+"-app Secret",
+				secretExists(ctx, k3d, server, target+"-app"))))
+
+		receiver, _ := psqlSuper(ctx, docker, server, target+"-1", "postgres", "SELECT count(*) FROM pg_stat_wal_receiver;")
+		senders, _ := psqlSuper(ctx, docker, server, sourcePrimary, "postgres",
+			"SELECT count(*) FROM pg_stat_replication WHERE application_name = 'pg-estate';")
+		checks = append(checks, boolCheck(receiver.count() == 0 && senders.count() == 0,
+			"And nothing is replicating — the copy stopped when the import finished",
+			fmt.Sprintf("%d WAL receiver(s), %d sender(s) for it on the source", receiver.count(), senders.count())))
+
+		checks = append(checks, boolCheck(sourceHealthy && targetHealthy,
+			"Both clusters are healthy",
+			fmt.Sprintf("source: %s; imported: %s", c.Status.Phase, targetPhase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-import-monolith", taskID)
+}
+
+// sortedKeysOf is sortedKeys for a string-valued map, used only to make a check's detail
+// readable when it lists what was actually found.
+func sortedKeysOf[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+/* ---- Labs 54–59: storage, maintenance, hibernation and snapshot modes ---- */
+
+// storageClassExpands reports whether a StorageClass allows volume expansion, and whether it
+// exists at all. An absent allowVolumeExpansion means false — the field is optional and its
+// zero value is the restrictive one.
+func storageClassExpands(ctx context.Context, k3d *K3D, server, name string) (allows, exists bool) {
+	var sc struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		AllowVolumeExpansion *bool `json:"allowVolumeExpansion"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &sc, "get", "storageclass", name); err != nil {
+		return false, false
+	}
+	return sc.AllowVolumeExpansion != nil && *sc.AllowVolumeExpansion, sc.Metadata.Name == name
+}
+
+// claim is one PersistentVolumeClaim, read for the three things these labs compare: what was
+// asked for, what is actually there, and which volume is behind it.
+type claim struct {
+	Metadata struct {
+		Name              string            `json:"name"`
+		CreationTimestamp time.Time         `json:"creationTimestamp"`
+		Labels            map[string]string `json:"labels"`
+	} `json:"metadata"`
+	Spec struct {
+		StorageClassName string `json:"storageClassName"`
+		VolumeName       string `json:"volumeName"`
+		DataSource       *struct {
+			Kind string `json:"kind"`
+			Name string `json:"name"`
+		} `json:"dataSource"`
+		Resources struct {
+			Requests map[string]string `json:"requests"`
+		} `json:"resources"`
+	} `json:"spec"`
+	Status struct {
+		Phase    string            `json:"phase"`
+		Capacity map[string]string `json:"capacity"`
+	} `json:"status"`
+}
+
+func readClaims(ctx context.Context, k3d *K3D, server string, args ...string) []claim {
+	var list struct {
+		Items []claim `json:"items"`
+	}
+	_ = kubectlJSON(ctx, k3d, server, &list, append([]string{"get", "pvc"}, args...)...)
+	sort.Slice(list.Items, func(i, j int) bool { return list.Items[i].Metadata.Name < list.Items[j].Metadata.Name })
+	return list.Items
+}
+
+func claimByName(claims []claim, name string) (claim, bool) {
+	for _, c := range claims {
+		if c.Metadata.Name == name {
+			return c, true
+		}
+	}
+	return claim{}, false
+}
+
+// clusterConditionOf returns the status and reason of one condition on the Cluster.
+func clusterConditionOf(ctx context.Context, k3d *K3D, server, cluster, condType string) (status, reason string) {
+	var c struct {
+		Status struct {
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+				Reason string `json:"reason"`
+			} `json:"conditions"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &c, "get", "cluster.postgresql.cnpg.io", cluster); err != nil {
+		return "", ""
+	}
+	for _, cond := range c.Status.Conditions {
+		if cond.Type == condType {
+			return cond.Status, cond.Reason
+		}
+	}
+	return "", ""
+}
+
+// budget is a PodDisruptionBudget as the drain labs read it: how many disruptions it is
+// currently prepared to allow, which is the number a drain runs into.
+type budget struct {
+	name    string
+	allowed int
+	healthy int
+}
+
+func readBudgets(ctx context.Context, k3d *K3D, server string) []budget {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Status struct {
+				DisruptionsAllowed int `json:"disruptionsAllowed"`
+				CurrentHealthy     int `json:"currentHealthy"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "poddisruptionbudgets"); err != nil {
+		return nil
+	}
+	var out []budget
+	for _, b := range list.Items {
+		out = append(out, budget{b.Metadata.Name, b.Status.DisruptionsAllowed, b.Status.CurrentHealthy})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+func budgetByName(budgets []budget, name string) (budget, bool) {
+	for _, b := range budgets {
+		if b.name == name {
+			return b, true
+		}
+	}
+	return budget{}, false
+}
+
+// unschedulableNodes lists the nodes a drain has cordoned.
+func unschedulableNodes(ctx context.Context, k3d *K3D, server string) []string {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Unschedulable bool `json:"unschedulable"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "nodes"); err != nil {
+		return nil
+	}
+	var out []string
+	for _, n := range list.Items {
+		if n.Spec.Unschedulable {
+			out = append(out, n.Metadata.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// snapshotOf reads one VolumeSnapshot: whether it is usable, and the annotations CloudNativePG
+// stamps on it — which are where the difference between a hot and a cold backup is recorded.
+type snapshotInfo struct {
+	exists      bool
+	readyToUse  bool
+	annotations map[string]string
+}
+
+func readSnapshot(ctx context.Context, k3d *K3D, server, name string) snapshotInfo {
+	var snap struct {
+		Metadata struct {
+			Name        string            `json:"name"`
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+		Status struct {
+			ReadyToUse *bool `json:"readyToUse"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &snap, "get", "volumesnapshot", name); err != nil {
+		return snapshotInfo{}
+	}
+	return snapshotInfo{
+		exists:      snap.Metadata.Name == name,
+		readyToUse:  snap.Status.ReadyToUse != nil && *snap.Status.ReadyToUse,
+		annotations: snap.Metadata.Annotations,
+	}
+}
+
+// backupModeOf returns a Backup's phase and what was *asked for* in spec.online. The spec is
+// the honest field: in this operator release .status.online reported true for a backup taken
+// with spec.online false, so nothing here reads it.
+func backupModeOf(ctx context.Context, k3d *K3D, server, name string) (phase string, online *bool, exists bool) {
+	var b struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Spec struct {
+			Online *bool `json:"online"`
+		} `json:"spec"`
+		Status struct {
+			Phase string `json:"phase"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &b, "get", "backup", name); err != nil {
+		return "", nil, false
+	}
+	return b.Status.Phase, b.Spec.Online, b.Metadata.Name == name
+}
+
+/* ---- Lab 54: Storage Expansion ---- */
+
+func checkStorageExpansion(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const dataClaim = "pg-cluster-1"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 1
+	claims := readClaims(ctx, k3d, server)
+	pvc, hasPVC := claimByName(claims, dataClaim)
+
+	var spec struct {
+		Spec struct {
+			Storage struct {
+				Size         string `json:"size"`
+				StorageClass string `json:"storageClass"`
+			} `json:"storage"`
+		} `json:"spec"`
+	}
+	_ = kubectlJSON(ctx, k3d, server, &spec, "get", "cluster.postgresql.cnpg.io", cluster)
+
+	switch taskID {
+	case "read-the-classes":
+		csiAllows, csiExists := storageClassExpands(ctx, k3d, server, "csi-hostpath-sc")
+		localAllows, localExists := storageClassExpands(ctx, k3d, server, "local-path")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(csiExists && localExists && csiAllows && !localAllows,
+			"Only one of the two StorageClasses allows volume expansion",
+			fmt.Sprintf("csi-hostpath-sc allows: %v, local-path allows: %v", csiAllows, localAllows)))
+		onRightClass := hasPVC && pvc.Spec.StorageClassName == "csi-hostpath-sc" &&
+			pvc.Spec.Resources.Requests["storage"] == "1Gi"
+		checks = append(checks, boolCheck(onRightClass,
+			"The cluster's volume is 1Gi on the class that allows it",
+			fmt.Sprintf("%s asks for %s on %s", dataClaim, pvc.Spec.Resources.Requests["storage"], pvc.Spec.StorageClassName)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/expandable-class.txt")
+		if !found {
+			checks = append(checks, noItem("/root/expandable-class.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/expandable-class.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, "csi-hostpath-sc"),
+			"It names the class that allows expansion", fmt.Sprintf("file says %q", firstLine(body))))
+		return finish(checks), nil
+
+	case "expand-it":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(spec.Spec.Storage.Size == "2Gi",
+			"The Cluster asks for 2Gi",
+			"spec.storage.size is "+detailOr("unset", spec.Spec.Storage.Size, spec.Spec.Storage.Size == "")))
+		grown := hasPVC && pvc.Status.Capacity["storage"] == "2Gi"
+		checks = append(checks, boolCheck(grown,
+			"And the claim has actually grown to 2Gi",
+			fmt.Sprintf("requested %s, capacity %s", pvc.Spec.Resources.Requests["storage"], pvc.Status.Capacity["storage"])))
+		// The claim keeps its name across a rebuild, so the volume behind it is the only thing
+		// that can tell an expansion from a replacement.
+		same := hasPVC && a.baselineVolume() != "" && pvc.Spec.VolumeName == a.baselineVolume()
+		checks = append(checks, boolCheck(same,
+			"On the same volume it started on — nothing was recreated",
+			fmt.Sprintf("now on %s, started on %s", pvc.Spec.VolumeName, a.baselineVolume())))
+		rows := tableCount(ctx, docker, server, cluster+"-1", "app", "notes")
+		checks = append(checks, boolCheck(healthy && rows.count() == 50,
+			"The cluster is healthy and the 50 rows are still there",
+			fmt.Sprintf("%s, %d rows", c.Status.Phase, rows.count())))
+		return finish(checks), nil
+
+	case "the-limits":
+		var checks []CheckItem
+		shrink, foundShrink := readFileAnyNode(ctx, docker, a, "/root/shrink-error.txt")
+		checks = append(checks, boolCheck(foundShrink && strings.Contains(shrink, "shrink"),
+			"/root/shrink-error.txt records the refusal",
+			detailOr("file not found on any node", firstLine(shrink), !foundShrink)))
+		checks = append(checks, boolCheck(spec.Spec.Storage.Size == "2Gi",
+			"The Cluster still asks for 2Gi — the refusal changed nothing",
+			"spec.storage.size is "+spec.Spec.Storage.Size))
+		noExp, foundNoExp := readFileAnyNode(ctx, docker, a, "/root/no-expansion-error.txt")
+		checks = append(checks, boolCheck(foundNoExp && strings.Contains(noExp, "support resize"),
+			"/root/no-expansion-error.txt records what a class without expansion says",
+			detailOr("file not found on any node", firstLine(noExp), !foundNoExp)))
+		same := hasPVC && a.baselineVolume() != "" && pvc.Spec.VolumeName == a.baselineVolume()
+		checks = append(checks, boolCheck(healthy && same,
+			"The cluster is healthy and still on its original volume",
+			fmt.Sprintf("%s, volume %s", c.Status.Phase, pvc.Spec.VolumeName)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-storage-expansion", taskID)
+}
+
+/* ---- Lab 55: A Dedicated WAL Volume ---- */
+
+// walSymlink returns what pg_wal inside the data directory points at, or "" when it is an
+// ordinary directory — which is the whole before-and-after of this lab.
+func walSymlink(ctx context.Context, docker *Docker, server, pod string) string {
+	out, ok := execInPod(ctx, docker, server, pod, "sh", "-c",
+		"readlink /var/lib/postgresql/data/pgdata/pg_wal || true")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func checkWALVolume(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	claims := readClaims(ctx, k3d, server, "-l", "cnpg.io/cluster="+cluster)
+	data, wal := 0, 0
+	for _, cl := range claims {
+		if strings.HasSuffix(cl.Metadata.Name, "-wal") {
+			if cl.Status.Phase == "Bound" {
+				wal++
+			}
+			continue
+		}
+		if cl.Status.Phase == "Bound" {
+			data++
+		}
+	}
+
+	var spec struct {
+		Spec struct {
+			WalStorage *struct {
+				Size string `json:"size"`
+			} `json:"walStorage"`
+		} `json:"spec"`
+	}
+	_ = kubectlJSON(ctx, k3d, server, &spec, "get", "cluster.postgresql.cnpg.io", cluster)
+
+	switch taskID {
+	case "where-the-wal-is":
+		var checks []CheckItem
+		link := walSymlink(ctx, docker, server, c.Status.CurrentPrimary)
+		checks = append(checks, boolCheck(link == "",
+			"pg_wal is a directory inside the data volume, not a link to anywhere",
+			detailOr("pg_wal points at "+link, "pg_wal is an ordinary directory", link != "")))
+		checks = append(checks, boolCheck(data == 3 && wal == 0,
+			"The cluster has one volume per instance and no more",
+			fmt.Sprintf("%d data claim(s), %d WAL claim(s)", data, wal)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/wal-path.txt")
+		if !found {
+			checks = append(checks, noItem("/root/wal-path.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/wal-path.txt was written", "found"))
+		checks = append(checks, boolCheck(strings.Contains(body, "pgdata/pg_wal"),
+			"It names the pg_wal directory inside the data directory",
+			fmt.Sprintf("file says %q", firstLine(body))))
+		return finish(checks), nil
+
+	case "give-it-a-volume":
+		var checks []CheckItem
+		asked := spec.Spec.WalStorage != nil && spec.Spec.WalStorage.Size != ""
+		checks = append(checks, boolCheck(asked,
+			"The Cluster asks for a WAL volume",
+			detailOr("spec.walStorage is not set", "spec.walStorage.size is "+detailOr("", spec.Spec.WalStorage.Size, spec.Spec.WalStorage == nil), !asked)))
+		checks = append(checks, boolCheck(wal == 3,
+			"Each instance has a second claim bound for it",
+			fmt.Sprintf("%d data claim(s), %d WAL claim(s)", data, wal)))
+
+		linked := 0
+		var detail []string
+		for _, pod := range instanceNames(ctx, k3d, server, cluster) {
+			link := walSymlink(ctx, docker, server, pod)
+			if strings.Contains(link, "/var/lib/postgresql/wal") {
+				linked++
+			}
+			detail = append(detail, pod+"→"+detailOr("(none)", link, link == ""))
+		}
+		checks = append(checks, boolCheck(linked == 3,
+			"And pg_wal inside every data directory is now a link to it", strings.Join(detail, " ")))
+
+		rows := tableCount(ctx, docker, server, c.Status.CurrentPrimary, "app", "notes")
+		checks = append(checks, boolCheck(healthy && rows.count() == 50,
+			"The cluster is healthy with all 3 instances, and the data is intact",
+			fmt.Sprintf("%s, %d/3 ready, %d rows", c.Status.Phase, c.Status.ReadyInstances, rows.count())))
+		return finish(checks), nil
+
+	case "one-way-door":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/walstorage-error.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "cannot be disabled"),
+			"/root/walstorage-error.txt records what happened when you tried to remove it",
+			detailOr("file not found on any node", firstLine(body), !found)))
+		checks = append(checks, boolCheck(spec.Spec.WalStorage != nil,
+			"The Cluster still has its WAL volume declared",
+			detailOr("spec.walStorage is gone", "spec.walStorage is still there", spec.Spec.WalStorage == nil)))
+		checks = append(checks, boolCheck(wal == 3 && data == 3,
+			"And all six claims are still bound",
+			fmt.Sprintf("%d data claim(s), %d WAL claim(s)", data, wal)))
+		checks = append(checks, boolCheck(healthy,
+			"The cluster is healthy",
+			fmt.Sprintf("%s, %d/3 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-wal-volume", taskID)
+}
+
+/* ---- Lab 56: Draining a Node ---- */
+
+func checkNodeDrain(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods, err := readInstancePods(ctx, k3d, server, cluster)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	budgets := readBudgets(ctx, k3d, server)
+	cordoned := unschedulableNodes(ctx, k3d, server)
+
+	switch taskID {
+	case "read-the-budgets":
+		var checks []CheckItem
+		_, hasReplicaPDB := budgetByName(budgets, cluster)
+		primaryPDB, hasPrimaryPDB := budgetByName(budgets, cluster+"-primary")
+		checks = append(checks, boolCheck(len(budgets) == 2 && hasReplicaPDB && hasPrimaryPDB,
+			"The operator maintains two PodDisruptionBudgets for this cluster",
+			fmt.Sprintf("%d budget(s): %v", len(budgets), budgets)))
+		checks = append(checks, boolCheck(hasPrimaryPDB && primaryPDB.allowed == 0,
+			"The primary's budget allows no disruptions at all",
+			fmt.Sprintf("%s allows %d", cluster+"-primary", primaryPDB.allowed)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/drain-target.txt")
+		if !found {
+			checks = append(checks, noItem("/root/drain-target.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/drain-target.txt was written", "found"))
+		target := firstLine(body)
+		primaryNode := ""
+		replicaNodes := map[string]bool{}
+		for _, p := range pods {
+			if p.Metadata.Name == c.Status.CurrentPrimary {
+				primaryNode = p.Spec.NodeName
+			} else if p.Spec.NodeName != "" {
+				replicaNodes[p.Spec.NodeName] = true
+			}
+		}
+		checks = append(checks, boolCheck(target != "" && target != primaryNode && replicaNodes[target],
+			"It names a node holding a replica, not the primary",
+			fmt.Sprintf("file says %q; the primary is on %q", target, primaryNode)))
+		return finish(checks), nil
+
+	case "drain-a-node":
+		body, _ := readFileAnyNode(ctx, docker, a, "/root/drain-target.txt")
+		target := firstLine(body)
+
+		var checks []CheckItem
+		isCordoned := false
+		for _, n := range cordoned {
+			if n == target {
+				isCordoned = true
+			}
+		}
+		checks = append(checks, boolCheck(isCordoned,
+			"The node you drained will take no new Pods",
+			fmt.Sprintf("cordoned nodes: %v", cordoned)))
+
+		pending := 0
+		for _, p := range pods {
+			if p.Status.Phase == "Pending" {
+				pending++
+			}
+		}
+		checks = append(checks, boolCheck(pending == 1,
+			"The instance that was on it is Pending, with nowhere to go",
+			fmt.Sprintf("%d instance(s) Pending", pending)))
+
+		msg, sawIt := failedSchedulingSaying(ctx, k3d, server, "node(s) were unschedulable")
+		checks = append(checks, boolCheck(sawIt,
+			"The scheduler says so itself",
+			detailOr("no FailedScheduling event mentions an unschedulable node", msg, !sawIt)))
+		checks = append(checks, boolCheck(c.Status.ReadyInstances == 2,
+			"The cluster is degraded but still serving on 2 of 3",
+			fmt.Sprintf("%s, %d/3 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+
+	case "maintenance-window":
+		body, _ := readFileAnyNode(ctx, docker, a, "/root/drain-target.txt")
+		target := firstLine(body)
+
+		var checks []CheckItem
+		warn, found := readFileAnyNode(ctx, docker, a, "/root/maintenance-warning.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(warn, "enablePDB"),
+			"/root/maintenance-warning.txt records what the API server said about this field",
+			detailOr("file not found on any node", firstLine(warn), !found)))
+
+		onDrained := 0
+		for _, p := range pods {
+			if p.Spec.NodeName == target {
+				onDrained++
+			}
+		}
+		checks = append(checks, boolCheck(target != "" && onDrained == 0,
+			"No instance is left on the node you drained",
+			fmt.Sprintf("%d instance(s) still on %s", onDrained, target)))
+		checks = append(checks, boolCheck(len(cordoned) == 0,
+			"Every node is schedulable again",
+			detailOr(fmt.Sprintf("still cordoned: %v", cordoned), "no node is cordoned", len(cordoned) > 0)))
+		checks = append(checks, boolCheck(c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3,
+			"And the cluster is healthy with all 3 instances",
+			fmt.Sprintf("%s, %d/3 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-node-drain", taskID)
+}
+
+/* ---- Lab 57: Draining a Node with One Instance ---- */
+
+func checkSingleInstanceDrain(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods, err := readInstancePods(ctx, k3d, server, cluster)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	budgets := readBudgets(ctx, k3d, server)
+	cordoned := unschedulableNodes(ctx, k3d, server)
+
+	var spec struct {
+		Spec struct {
+			EnablePDB *bool `json:"enablePDB"`
+		} `json:"spec"`
+	}
+	_ = kubectlJSON(ctx, k3d, server, &spec, "get", "cluster.postgresql.cnpg.io", cluster)
+
+	switch taskID {
+	case "one-budget":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(c.Status.Instances == 1 && len(pods) == 1,
+			"The cluster has exactly one instance",
+			fmt.Sprintf("%d instance(s)", len(pods))))
+		primaryPDB, has := budgetByName(budgets, cluster+"-primary")
+		checks = append(checks, boolCheck(len(budgets) == 1 && has && primaryPDB.allowed == 0,
+			"And one PodDisruptionBudget, which allows no disruptions",
+			fmt.Sprintf("%d budget(s): %v", len(budgets), budgets)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/instance-node.txt")
+		if !found {
+			checks = append(checks, noItem("/root/instance-node.txt was written", "file not found on any node"))
+			return finish(checks), nil
+		}
+		checks = append(checks, okItem("/root/instance-node.txt was written", "found"))
+		node := ""
+		if len(pods) > 0 {
+			node = pods[0].Spec.NodeName
+		}
+		checks = append(checks, boolCheck(node != "" && strings.Contains(body, node),
+			"It names the node the instance is on",
+			fmt.Sprintf("file says %q, the instance is on %q", firstLine(body), node)))
+		return finish(checks), nil
+
+	case "drain-blocked":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/drain-error.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "disruption budget"),
+			"/root/drain-error.txt records the eviction being refused",
+			detailOr("file not found on any node", "the drain output names the disruption budget", !found)))
+		checks = append(checks, boolCheck(len(cordoned) == 1,
+			"The node is cordoned — a drain cordons first and evicts afterwards",
+			fmt.Sprintf("cordoned nodes: %v", cordoned)))
+		running := runningCount(pods)
+		checks = append(checks, boolCheck(running == 1 && c.Status.ReadyInstances == 1,
+			"But the instance is still running, and the database is still up",
+			fmt.Sprintf("%d Running, %d/1 ready", running, c.Status.ReadyInstances)))
+		return finish(checks), nil
+
+	case "disable-the-budget":
+		var checks []CheckItem
+		off := spec.Spec.EnablePDB != nil && !*spec.Spec.EnablePDB
+		checks = append(checks, boolCheck(off,
+			"PodDisruptionBudgets are switched off for this cluster",
+			detailOr("spec.enablePDB is not false", "spec.enablePDB: false", !off)))
+		checks = append(checks, boolCheck(len(budgets) == 0,
+			"And there are none left to refuse an eviction",
+			fmt.Sprintf("%d budget(s) remain", len(budgets))))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/outage.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "Pending"),
+			"/root/outage.txt records the instance with nowhere to run",
+			detailOr("file not found on any node", firstLine(body), !found)))
+		checks = append(checks, boolCheck(len(cordoned) == 0 && c.Status.ReadyInstances == 1,
+			"And after uncordoning, the instance is back",
+			fmt.Sprintf("cordoned: %v, %d/1 ready", cordoned, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-single-instance-drain", taskID)
+}
+
+/* ---- Lab 58: Declarative Hibernation ---- */
+
+func checkDeclarativeHibernation(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	pods, err := readInstancePods(ctx, k3d, server, cluster)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	claims := readClaims(ctx, k3d, server, "-l", "cnpg.io/cluster="+cluster)
+	bound := 0
+	for _, cl := range claims {
+		if cl.Status.Phase == "Bound" {
+			bound++
+		}
+	}
+	annotation := clusterAnnotation(ctx, k3d, server, cluster, "cnpg.io/hibernation")
+
+	var spec struct {
+		Spec struct {
+			PostgreSQL struct {
+				Parameters map[string]string `json:"parameters"`
+			} `json:"postgresql"`
+		} `json:"spec"`
+	}
+	_ = kubectlJSON(ctx, k3d, server, &spec, "get", "cluster.postgresql.cnpg.io", cluster)
+
+	switch taskID {
+	case "put-it-to-sleep":
+		status, reason := clusterConditionOf(ctx, k3d, server, cluster, "cnpg.io/hibernation")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(annotation == "on",
+			"The Cluster is annotated cnpg.io/hibernation: on",
+			"the annotation reads "+detailOr("(absent)", annotation, annotation == "")))
+		checks = append(checks, boolCheck(len(pods) == 0,
+			"Every instance Pod is gone", fmt.Sprintf("%d instance Pod(s)", len(pods))))
+		checks = append(checks, boolCheck(bound == 3,
+			"All 3 volumes are still bound — the data is kept",
+			fmt.Sprintf("%d of %d claim(s) bound", bound, len(claims))))
+		checks = append(checks, boolCheck(status == "True" && reason == "Hibernated",
+			"And the cluster reports a hibernation condition",
+			fmt.Sprintf("condition cnpg.io/hibernation is %q/%q", status, reason)))
+		return finish(checks), nil
+
+	case "what-remains":
+		services := readMeta(ctx, k3d, server, "svc", "-l", "cnpg.io/cluster="+cluster)
+		endpoints := 0
+		for _, svc := range []string{cluster + "-rw", cluster + "-ro", cluster + "-r"} {
+			ips, _ := serviceEndpointIPs(ctx, k3d, server, svc)
+			endpoints += len(ips)
+		}
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(len(services.Items) == 3,
+			"All three Services are still there",
+			fmt.Sprintf("%d Service(s)", len(services.Items))))
+		checks = append(checks, boolCheck(endpoints == 0,
+			"And not one of them has an endpoint to send anything to",
+			fmt.Sprintf("%d endpoint(s) across the three", endpoints)))
+		checks = append(checks, boolCheck(secretExists(ctx, k3d, server, cluster+"-app"),
+			"The generated application Secret is untouched",
+			detailOr("the "+cluster+"-app Secret is gone", "the "+cluster+"-app Secret is still there",
+				!secretExists(ctx, k3d, server, cluster+"-app"))))
+		asked := spec.Spec.PostgreSQL.Parameters["max_connections"]
+		checks = append(checks, boolCheck(asked == "200" && len(pods) == 0,
+			"And the spec took an edit while it slept — max_connections now asks for 200",
+			fmt.Sprintf("spec asks for %q, %d Pod(s) running", detailOr("(unset)", asked, asked == ""), len(pods))))
+		return finish(checks), nil
+
+	case "wake-it-up":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(annotation == "off",
+			"The hibernation annotation reads off",
+			"the annotation reads "+detailOr("(absent)", annotation, annotation == "")))
+
+		// The Pods are new; the volumes are not. That gap is the proof that hibernation kept
+		// the data and threw away only the compute.
+		reused := len(pods) == 3
+		for _, p := range pods {
+			cl, ok := claimByName(claims, p.Metadata.Name)
+			if !ok || !cl.Metadata.CreationTimestamp.Before(p.Metadata.CreationTimestamp) {
+				reused = false
+			}
+		}
+		checks = append(checks, boolCheck(reused,
+			"All 3 instances are back, on volumes older than themselves",
+			fmt.Sprintf("%d Pod(s), %d bound claim(s)", len(pods), bound)))
+
+		running, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "postgres", "SHOW max_connections;")
+		checks = append(checks, boolCheck(strings.TrimSpace(running.stdout) == "200",
+			"The setting you changed while it slept is in force",
+			fmt.Sprintf("max_connections is %q", strings.TrimSpace(running.stdout))))
+
+		rows := tableCount(ctx, docker, server, c.Status.CurrentPrimary, "app", "notes")
+		checks = append(checks, boolCheck(rows.count() == 50 &&
+			c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3,
+			"And the rows written before it slept are still there",
+			fmt.Sprintf("%d rows, %s, %d/3 ready", rows.count(), c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-declarative-hibernation", taskID)
+}
+
+/* ---- Lab 59: Hot and Cold Snapshot Backups ---- */
+
+func checkSnapshotModes(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const restored = "pg-restored"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 1
+
+	switch taskID {
+	case "hot-backup":
+		phase, online, exists := backupModeOf(ctx, k3d, server, "hot-backup")
+		snap := readSnapshot(ctx, k3d, server, "hot-backup")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(exists && phase == "completed",
+			"The hot backup completed",
+			detailOr("no Backup named hot-backup yet", "phase is "+phase, !exists)))
+		checks = append(checks, boolCheck(online != nil && *online,
+			"It was taken online — spec.online is true",
+			detailOr("spec.online is not true", "spec.online: true", online == nil || !*online)))
+		checks = append(checks, boolCheck(snap.exists && snap.readyToUse,
+			"Its VolumeSnapshot is ready to use",
+			fmt.Sprintf("exists: %v, readyToUse: %v", snap.exists, snap.readyToUse)))
+		_, hasLabel := snap.annotations["cnpg.io/backupLabelFile"]
+		checks = append(checks, boolCheck(hasLabel,
+			"And it carries a backup label, because the database was running throughout",
+			detailOr("the snapshot carries no cnpg.io/backupLabelFile annotation",
+				"cnpg.io/backupLabelFile is present", !hasLabel)))
+		return finish(checks), nil
+
+	case "cold-backup":
+		phase, online, exists := backupModeOf(ctx, k3d, server, "cold-backup")
+		snap := readSnapshot(ctx, k3d, server, "cold-backup")
+		_, hasLabel := snap.annotations["cnpg.io/backupLabelFile"]
+		controlData := snap.annotations["cnpg.io/pgControldata"]
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(exists && phase == "completed" && online != nil && !*online,
+			"The cold backup completed, with spec.online false",
+			fmt.Sprintf("phase %q, spec.online %v", phase, online != nil && *online)))
+		checks = append(checks, boolCheck(snap.exists && snap.readyToUse && !hasLabel,
+			"Its snapshot is ready and carries no backup label — nothing was running to label",
+			fmt.Sprintf("readyToUse: %v, backup label present: %v", snap.readyToUse, hasLabel)))
+		shutDown := strings.Contains(controlData, "shut down")
+		checks = append(checks, boolCheck(shutDown,
+			"The control file inside it says the database was shut down",
+			detailOr("the snapshot's recorded control file does not say shut down",
+				"Database cluster state: shut down", !shutDown)))
+		fenced := clusterAnnotation(ctx, k3d, server, cluster, "cnpg.io/fencedInstances")
+		clear := fenced == "" || fenced == "[]"
+		checks = append(checks, boolCheck(clear && healthy,
+			"And nothing is fenced any more — the instance is Ready again",
+			fmt.Sprintf("fencedInstances %q, %s", fenced, c.Status.Phase)))
+		return finish(checks), nil
+
+	case "restore-the-cold-one":
+		phase, ready, exists := clusterPhase(ctx, k3d, server, restored)
+		claims := readClaims(ctx, k3d, server)
+		pvc, hasPVC := claimByName(claims, restored+"-1")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(exists && phase == "Cluster in healthy state" && ready == 1,
+			"A cluster named pg-restored reports healthy",
+			detailOr("pg-restored does not exist yet", phase+fmt.Sprintf(", %d/1 ready", ready), !exists)))
+		fromCold := hasPVC && pvc.Spec.DataSource != nil &&
+			pvc.Spec.DataSource.Kind == "VolumeSnapshot" && pvc.Spec.DataSource.Name == "cold-backup"
+		checks = append(checks, boolCheck(fromCold,
+			"Its volume was created from the cold snapshot",
+			detailOr("the claim names no VolumeSnapshot as its dataSource",
+				"dataSource is the cold-backup VolumeSnapshot", !fromCold)))
+		rows := tableCount(ctx, docker, server, restored+"-1", "app", "notes")
+		checks = append(checks, boolCheck(rows.count() == 50,
+			"It carries all 50 rows", fmt.Sprintf("%d rows", rows.count())))
+		checks = append(checks, boolCheck(healthy,
+			"And the cluster it was taken from is untouched",
+			fmt.Sprintf("%s, %d/1 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-snapshot-modes", taskID)
+}
+
+/* ---- Labs 60–63: snapshot PITR, plugin and scheduled backups, managed roles ---- */
+
+// backupNames lists the Backup objects in the namespace, with their phase and requested mode.
+type backupRow struct {
+	name   string
+	phase  string
+	method string
+	online *bool
+}
+
+func readBackups(ctx context.Context, k3d *K3D, server string) []backupRow {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Method string `json:"method"`
+				Online *bool  `json:"online"`
+			} `json:"spec"`
+			Status struct {
+				Phase string `json:"phase"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "backup"); err != nil {
+		return nil
+	}
+	var out []backupRow
+	for _, b := range list.Items {
+		out = append(out, backupRow{b.Metadata.Name, b.Status.Phase, b.Spec.Method, b.Spec.Online})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+func (b backupRow) isOnline() bool  { return b.online == nil || *b.online }
+func (b backupRow) isOffline() bool { return b.online != nil && !*b.online }
+
+// String keeps a check's detail readable: a %v of the struct would print the address of the
+// online pointer, which tells a learner nothing at all.
+func (b backupRow) String() string {
+	mode := "online unset"
+	if b.online != nil {
+		mode = fmt.Sprintf("online=%v", *b.online)
+	}
+	return fmt.Sprintf("%s(%s, %s)", b.name, b.phase, mode)
+}
+
+// snapshotNames lists the VolumeSnapshots, which is how the labs count what has accumulated.
+func snapshotNames(ctx context.Context, k3d *K3D, server string) []string {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "volumesnapshot"); err != nil {
+		return nil
+	}
+	var out []string
+	for _, s := range list.Items {
+		out = append(out, s.Metadata.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+/* ---- Lab 60: Point-in-Time Recovery from a Volume Snapshot ---- */
+
+func checkSnapshotPITR(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	sourceHealthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 1
+
+	// The proof of a point-in-time recovery is which of two rows arrived, so both checks below
+	// read the same table on whichever cluster they are asking about.
+	rowsOn := func(pod string) (first, second int) {
+		f, _ := psqlSuper(ctx, docker, server, pod, "app", "SELECT count(*) FROM pitr_proof WHERE note = 'first';")
+		s, _ := psqlSuper(ctx, docker, server, pod, "app", "SELECT count(*) FROM pitr_proof WHERE note = 'second';")
+		return f.count(), s.count()
+	}
+
+	recovered := func(name, snapshot string) []CheckItem {
+		phase, ready, exists := clusterPhase(ctx, k3d, server, name)
+		claims := readClaims(ctx, k3d, server)
+		pvc, hasPVC := claimByName(claims, name+"-1")
+		first, second := rowsOn(name + "-1")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(exists && phase == "Cluster in healthy state" && ready == 1,
+			"A cluster named "+name+" reports healthy",
+			detailOr(name+" does not exist yet", phase+fmt.Sprintf(", %d/1 ready", ready), !exists)))
+		fromSnapshot := hasPVC && pvc.Spec.DataSource != nil &&
+			pvc.Spec.DataSource.Kind == "VolumeSnapshot" && pvc.Spec.DataSource.Name == snapshot
+		checks = append(checks, boolCheck(fromSnapshot,
+			"Its volume was created from the "+snapshot+" snapshot",
+			detailOr("the claim names no VolumeSnapshot as its dataSource",
+				"dataSource is the "+snapshot+" VolumeSnapshot", !fromSnapshot)))
+		checks = append(checks, boolCheck(first == 1,
+			"It carries the row written before your target time",
+			fmt.Sprintf("%d row(s) noted 'first'", first)))
+		checks = append(checks, boolCheck(second == 0,
+			"And not the one written after it",
+			fmt.Sprintf("%d row(s) noted 'second'", second)))
+		return checks
+	}
+
+	switch taskID {
+	case "take-both-snapshots":
+		status, _ := clusterConditionOf(ctx, k3d, server, cluster, "ContinuousArchiving")
+		backups := readBackups(ctx, k3d, server)
+		hot, cold := false, false
+		for _, b := range backups {
+			if b.name == "hot-backup" && b.phase == "completed" && b.isOnline() {
+				hot = true
+			}
+			if b.name == "cold-backup" && b.phase == "completed" && b.isOffline() {
+				cold = true
+			}
+		}
+		hotSnap := readSnapshot(ctx, k3d, server, "hot-backup")
+		coldSnap := readSnapshot(ctx, k3d, server, "cold-backup")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(status == "True",
+			"WAL archiving is working — the archive is what makes a target time reachable",
+			"ContinuousArchiving is "+detailOr("(absent)", status, status == "")))
+		checks = append(checks, boolCheck(hot && cold,
+			"Both backups completed, one online and one not",
+			fmt.Sprintf("%d backup(s): %v", len(backups), backups)))
+		checks = append(checks, boolCheck(hotSnap.readyToUse && coldSnap.readyToUse,
+			"And both snapshots are ready to use",
+			fmt.Sprintf("hot ready: %v, cold ready: %v", hotSnap.readyToUse, coldSnap.readyToUse)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/target-time.txt")
+		if !found {
+			checks = append(checks, noItem("/root/target-time.txt holds a moment between two rows", "file not found on any node"))
+			return finish(checks), nil
+		}
+		// The target has to sit strictly between the two commits, or the recovery afterwards
+		// proves nothing. The database's own clock is the only one that can settle it.
+		between, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", fmt.Sprintf(
+			"SELECT count(*) FROM pitr_proof WHERE (note = 'first' AND at < '%s') OR (note = 'second' AND at > '%s');",
+			strings.TrimSpace(firstLine(body)), strings.TrimSpace(firstLine(body))))
+		checks = append(checks, boolCheck(between.count() == 2,
+			"/root/target-time.txt holds a moment between two rows",
+			fmt.Sprintf("file says %q; %d of 2 rows fall on the right side of it", firstLine(body), between.count())))
+		return finish(checks), nil
+
+	case "recover-from-the-hot-one":
+		return finish(recovered("pg-hot-pitr", "hot-backup")), nil
+
+	case "recover-from-the-cold-one":
+		checks := recovered("pg-cold-pitr", "cold-backup")
+		checks = append(checks, boolCheck(sourceHealthy,
+			"And the cluster all three came from is untouched",
+			fmt.Sprintf("%s, %d/1 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-snapshot-pitr", taskID)
+}
+
+/* ---- Lab 61: Backups with the cnpg plugin ---- */
+
+func checkPluginSnapshotBackup(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 1
+	backups := readBackups(ctx, k3d, server)
+
+	// The plugin names an unnamed backup after the cluster and the moment, so the online one is
+	// found by shape rather than by a name the lab dictates.
+	var generated *backupRow
+	for i, b := range backups {
+		if b.name != "cold-by-plugin" && b.method == "volumeSnapshot" && b.phase == "completed" {
+			generated = &backups[i]
+			break
+		}
+	}
+	cold, hasCold := backupRow{}, false
+	for _, b := range backups {
+		if b.name == "cold-by-plugin" {
+			cold, hasCold = b, true
+		}
+	}
+
+	switch taskID {
+	case "plugin-backup":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(generated != nil,
+			"The plugin created a volumeSnapshot Backup, and it completed",
+			fmt.Sprintf("%d backup(s): %v", len(backups), backups)))
+		online := generated != nil && generated.isOnline()
+		checks = append(checks, boolCheck(online,
+			"It was taken online, which is what the plugin asks for by default",
+			detailOr("no completed online backup found", "spec.online is true or unset", !online)))
+		ready := false
+		if generated != nil {
+			ready = readSnapshot(ctx, k3d, server, generated.name).readyToUse
+		}
+		checks = append(checks, boolCheck(ready,
+			"Its VolumeSnapshot is ready to use",
+			fmt.Sprintf("readyToUse: %v", ready)))
+		checks = append(checks, boolCheck(healthy,
+			"And the cluster is healthy — nothing was interrupted",
+			fmt.Sprintf("%s, %d/1 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+
+	case "cold-by-plugin":
+		snap := readSnapshot(ctx, k3d, server, "cold-by-plugin")
+		_, hasLabel := snap.annotations["cnpg.io/backupLabelFile"]
+		shutDown := strings.Contains(snap.annotations["cnpg.io/pgControldata"], "shut down")
+		fenced := clusterAnnotation(ctx, k3d, server, cluster, "cnpg.io/fencedInstances")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(hasCold && cold.phase == "completed",
+			"A Backup named cold-by-plugin completed",
+			detailOr("no Backup called cold-by-plugin yet", "phase is "+cold.phase, !hasCold)))
+		checks = append(checks, boolCheck(hasCold && cold.isOffline(),
+			"The plugin asked for it offline — spec.online is false",
+			fmt.Sprintf("spec.online is %v", hasCold && cold.isOnline())))
+		checks = append(checks, boolCheck(shutDown && !hasLabel,
+			"Its snapshot records a shut down database and carries no backup label",
+			fmt.Sprintf("control file says shut down: %v, backup label present: %v", shutDown, hasLabel)))
+		clear := fenced == "" || fenced == "[]"
+		checks = append(checks, boolCheck(clear && healthy,
+			"And the instance is Ready again, with nothing fenced",
+			fmt.Sprintf("fencedInstances %q, %s", fenced, c.Status.Phase)))
+		return finish(checks), nil
+
+	case "what-the-plugin-made":
+		completed := 0
+		for _, b := range backups {
+			if b.method == "volumeSnapshot" && b.phase == "completed" {
+				completed++
+			}
+		}
+		var last struct {
+			Status struct {
+				LastSuccessfulBackup string `json:"lastSuccessfulBackup"`
+			} `json:"status"`
+		}
+		_ = kubectlJSON(ctx, k3d, server, &last, "get", "cluster.postgresql.cnpg.io", cluster)
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(completed >= 2,
+			"Both of the plugin's Backups are ordinary Backup objects, and both completed",
+			fmt.Sprintf("%d completed volumeSnapshot backup(s)", completed)))
+		checks = append(checks, boolCheck(generated != nil && hasCold && generated.isOnline() && cold.isOffline(),
+			"One asked for online and the other did not",
+			fmt.Sprintf("%v", backups)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/backups.txt")
+		if !found {
+			checks = append(checks, noItem("/root/backups.txt lists what the plugin created", "file not found on any node"))
+			return finish(checks), nil
+		}
+		listed := strings.Contains(body, "cold-by-plugin") && generated != nil && strings.Contains(body, generated.name)
+		checks = append(checks, boolCheck(listed,
+			"/root/backups.txt lists what the plugin created",
+			fmt.Sprintf("file names cold-by-plugin: %v", strings.Contains(body, "cold-by-plugin"))))
+		checks = append(checks, boolCheck(last.Status.LastSuccessfulBackup != "",
+			"And the cluster records when it was last backed up",
+			"status.lastSuccessfulBackup is "+detailOr("(empty)", last.Status.LastSuccessfulBackup, last.Status.LastSuccessfulBackup == "")))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-plugin-snapshot-backup", taskID)
+}
+
+/* ---- Lab 62: Scheduled snapshot backups ---- */
+
+// schedule is a ScheduledBackup as this lab reads it.
+type schedule struct {
+	name      string
+	suspended bool
+	online    *bool
+	method    string
+	lastTime  string
+	nextTime  string
+}
+
+func readSchedules(ctx context.Context, k3d *K3D, server string) []schedule {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Suspend *bool  `json:"suspend"`
+				Online  *bool  `json:"online"`
+				Method  string `json:"method"`
+			} `json:"spec"`
+			Status struct {
+				LastScheduleTime string `json:"lastScheduleTime"`
+				NextScheduleTime string `json:"nextScheduleTime"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "scheduledbackup"); err != nil {
+		return nil
+	}
+	var out []schedule
+	for _, sb := range list.Items {
+		out = append(out, schedule{
+			name:      sb.Metadata.Name,
+			suspended: sb.Spec.Suspend != nil && *sb.Spec.Suspend,
+			online:    sb.Spec.Online,
+			method:    sb.Spec.Method,
+			lastTime:  sb.Status.LastScheduleTime,
+			nextTime:  sb.Status.NextScheduleTime,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+func scheduleByName(schedules []schedule, name string) (schedule, bool) {
+	for _, s := range schedules {
+		if s.name == name {
+			return s, true
+		}
+	}
+	return schedule{}, false
+}
+
+// backupsFrom returns the Backups a schedule has produced, which are named after it.
+func backupsFrom(backups []backupRow, scheduleName string) []backupRow {
+	var out []backupRow
+	for _, b := range backups {
+		if strings.HasPrefix(b.name, scheduleName+"-") {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func checkScheduledSnapshots(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const onlineSchedule = "every-minute-online"
+	const coldSchedule = "every-two-minutes-cold"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 1
+	schedules := readSchedules(ctx, k3d, server)
+	backups := readBackups(ctx, k3d, server)
+
+	switch taskID {
+	case "schedule-it":
+		sb, has := scheduleByName(schedules, onlineSchedule)
+		produced := backupsFrom(backups, onlineSchedule)
+		completed := 0
+		ready := 0
+		for _, b := range produced {
+			if b.phase == "completed" {
+				completed++
+				if readSnapshot(ctx, k3d, server, b.name).readyToUse {
+					ready++
+				}
+			}
+		}
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(has && sb.method == "volumeSnapshot",
+			"A ScheduledBackup exists, taking volume snapshots",
+			detailOr("no ScheduledBackup called "+onlineSchedule, "method is "+sb.method, !has)))
+		checks = append(checks, boolCheck(has && sb.isOnline(),
+			"It runs online, so the database keeps serving on every run",
+			fmt.Sprintf("spec.online is %v", has && sb.isOnline())))
+		checks = append(checks, boolCheck(completed >= 1,
+			"It has already produced at least one completed Backup",
+			fmt.Sprintf("%d backup(s) from the schedule, %d completed", len(produced), completed)))
+		checks = append(checks, boolCheck(ready >= 1 && has && sb.lastTime != "",
+			"With a VolumeSnapshot ready to use, and a recorded last schedule time",
+			fmt.Sprintf("%d snapshot(s) ready, lastScheduleTime %q", ready, sb.lastTime)))
+		return finish(checks), nil
+
+	case "schedule-a-cold-one":
+		sb, has := scheduleByName(schedules, coldSchedule)
+		produced := backupsFrom(backups, coldSchedule)
+		coldName := ""
+		for _, b := range produced {
+			if b.phase == "completed" && b.isOffline() {
+				coldName = b.name
+			}
+		}
+		snap := readSnapshot(ctx, k3d, server, coldName)
+		_, hasLabel := snap.annotations["cnpg.io/backupLabelFile"]
+		shutDown := strings.Contains(snap.annotations["cnpg.io/pgControldata"], "shut down")
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(has && sb.isOffline(),
+			"A second schedule exists, and it runs offline",
+			detailOr("no ScheduledBackup called "+coldSchedule, "spec.online is false", !has)))
+		checks = append(checks, boolCheck(coldName != "",
+			"It has produced a completed Backup of its own",
+			fmt.Sprintf("%d backup(s) from the schedule", len(produced))))
+		checks = append(checks, boolCheck(shutDown && !hasLabel,
+			"Whose snapshot records a shut down database, with no backup label",
+			fmt.Sprintf("control file says shut down: %v, backup label present: %v", shutDown, hasLabel)))
+		checks = append(checks, boolCheck(healthy,
+			"And the cluster is healthy again between runs",
+			fmt.Sprintf("%s, %d/1 ready", c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+
+	case "nobody-prunes-these":
+		var spec struct {
+			Spec struct {
+				Backup struct {
+					VolumeSnapshot struct {
+						SnapshotOwnerReference string `json:"snapshotOwnerReference"`
+					} `json:"volumeSnapshot"`
+				} `json:"backup"`
+			} `json:"spec"`
+		}
+		_ = kubectlJSON(ctx, k3d, server, &spec, "get", "cluster.postgresql.cnpg.io", cluster)
+
+		suspended := 0
+		for _, sb := range schedules {
+			if sb.suspended {
+				suspended++
+			}
+		}
+		snapshots := snapshotNames(ctx, k3d, server)
+
+		var checks []CheckItem
+		checks = append(checks, boolCheck(len(schedules) == 2 && suspended == 2,
+			"Both schedules are suspended",
+			fmt.Sprintf("%d of %d schedule(s) suspended", suspended, len(schedules))))
+		owner := spec.Spec.Backup.VolumeSnapshot.SnapshotOwnerReference
+		checks = append(checks, boolCheck(owner == "backup",
+			"The cluster now asks for new snapshots to be owned by their Backup",
+			"snapshotOwnerReference is "+detailOr("(unset)", owner, owner == "")))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/orphan-snapshot.txt")
+		if !found {
+			checks = append(checks, noItem("/root/orphan-snapshot.txt names a snapshot that outlived its Backup", "file not found on any node"))
+			return finish(checks), nil
+		}
+		orphan := firstLine(body)
+		snapshotThere, backupGone := false, true
+		for _, n := range snapshots {
+			if n == orphan {
+				snapshotThere = true
+			}
+		}
+		for _, b := range backups {
+			if b.name == orphan {
+				backupGone = false
+			}
+		}
+		checks = append(checks, boolCheck(orphan != "" && snapshotThere && backupGone,
+			"/root/orphan-snapshot.txt names a snapshot that outlived its Backup",
+			fmt.Sprintf("%q: snapshot present %v, Backup gone %v", orphan, snapshotThere, backupGone)))
+		// Deliberately not gated on the cluster being ready: the cold schedule fences the
+		// instance while it runs, so a check taken seconds after suspending one would fail on
+		// something that has nothing to do with what this objective is about.
+		checks = append(checks, boolCheck(len(snapshots) >= 2,
+			"And the snapshots that accumulated are all still there",
+			fmt.Sprintf("%d snapshot(s), %s", len(snapshots), c.Status.Phase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-scheduled-snapshots", taskID)
+}
+
+func (s schedule) isOnline() bool  { return s.online == nil || *s.online }
+func (s schedule) isOffline() bool { return s.online != nil && !*s.online }
+
+/* ---- Lab 63: Managed roles ---- */
+
+// managedRole is one entry of spec.managed.roles, read back off the Cluster.
+type managedRole struct {
+	Name      string `json:"name"`
+	Ensure    string `json:"ensure"`
+	Login     *bool  `json:"login"`
+	Superuser *bool  `json:"superuser"`
+	CreateDB  *bool  `json:"createdb"`
+	Comment   string `json:"comment"`
+	// Read by the password-maintenance lab only.
+	DisablePassword *bool  `json:"disablePassword"`
+	ValidUntil      string `json:"validUntil"`
+	PasswordSecret  struct {
+		Name string `json:"name"`
+	} `json:"passwordSecret"`
+}
+
+func readManagedRoles(ctx context.Context, k3d *K3D, server, cluster string) ([]managedRole, []string, []string) {
+	var c struct {
+		Spec struct {
+			Managed struct {
+				Roles []managedRole `json:"roles"`
+			} `json:"managed"`
+		} `json:"spec"`
+		Status struct {
+			ManagedRolesStatus struct {
+				ByStatus        map[string][]string `json:"byStatus"`
+				CannotReconcile map[string][]string `json:"cannotReconcile"`
+			} `json:"managedRolesStatus"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &c, "get", "cluster.postgresql.cnpg.io", cluster); err != nil {
+		return nil, nil, nil
+	}
+	var reconciled []string
+	for status, names := range c.Status.ManagedRolesStatus.ByStatus {
+		if status == "reconciled" {
+			reconciled = append(reconciled, names...)
+		}
+	}
+	var problems []string
+	for name, msgs := range c.Status.ManagedRolesStatus.CannotReconcile {
+		problems = append(problems, name+": "+strings.Join(msgs, "; "))
+	}
+	sort.Strings(reconciled)
+	sort.Strings(problems)
+	return c.Spec.Managed.Roles, reconciled, problems
+}
+
+// roleAttributes reads one role straight out of the database, which is the only place that
+// settles what the operator actually did.
+func roleAttributes(ctx context.Context, docker *Docker, server, pod, role string) (exists, canLogin, createDB bool, comment string) {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres", fmt.Sprintf(
+		"SELECT rolcanlogin || '|' || rolcreatedb || '|' || coalesce(shobj_description(oid, 'pg_authid'), '') FROM pg_roles WHERE rolname = '%s';", role))
+	if err != nil || !res.ok() || strings.TrimSpace(res.stdout) == "" {
+		return false, false, false, ""
+	}
+	parts := strings.SplitN(strings.TrimSpace(res.stdout), "|", 3)
+	if len(parts) < 3 {
+		return true, false, false, ""
+	}
+	return true, strings.HasPrefix(parts[0], "t"), strings.HasPrefix(parts[1], "t"), parts[2]
+}
+
+func checkManagedRoles(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const role = "analyst"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	declared, reconciled, problems := readManagedRoles(ctx, k3d, server, cluster)
+	exists, canLogin, createDB, comment := roleAttributes(ctx, docker, server, c.Status.CurrentPrimary, role)
+
+	var wanted *managedRole
+	for i, r := range declared {
+		if r.Name == role {
+			wanted = &declared[i]
+		}
+	}
+	isReconciled := false
+	for _, n := range reconciled {
+		if n == role {
+			isReconciled = true
+		}
+	}
+
+	switch taskID {
+	case "declare-a-role":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(wanted != nil,
+			"The Cluster declares a managed role called analyst",
+			detailOr("spec.managed.roles names no analyst", fmt.Sprintf("%d role(s) declared", len(declared)), wanted == nil)))
+		checks = append(checks, boolCheck(exists && canLogin,
+			"The role exists in the database and may log in",
+			fmt.Sprintf("exists: %v, can log in: %v", exists, canLogin)))
+		checks = append(checks, boolCheck(isReconciled,
+			"And the operator reports it reconciled",
+			fmt.Sprintf("reconciled roles: %v; problems: %v", reconciled, problems)))
+
+		// Connecting as the role is the only thing that proves the password from the Secret
+		// really reached PostgreSQL.
+		try := psqlAsUser(ctx, docker, server, cluster+"-rw", role, "analyst_pw", "app", "SELECT 1;")
+		checks = append(checks, boolCheck(try.ok(),
+			"You can connect as it with the password from the Secret",
+			detailOr(firstLine(try.stderr), "connected and ran a query", !try.ok())))
+		return finish(checks), nil
+
+	case "the-operator-owns-it":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(wanted != nil && wanted.CreateDB != nil && *wanted.CreateDB,
+			"The Cluster now declares the role with createdb",
+			detailOr("spec.managed.roles does not ask for createdb", "createdb: true is declared",
+				wanted == nil || wanted.CreateDB == nil || !*wanted.CreateDB)))
+		checks = append(checks, boolCheck(createDB,
+			"And the database agrees",
+			fmt.Sprintf("rolcreatedb is %v", createDB)))
+		// The finding this objective is built on: an ALTER ROLE made outside the spec is *not*
+		// reverted, and the operator goes on reporting the role as reconciled, because it
+		// compares against what it last applied rather than against the database.
+		body, found := readFileAnyNode(ctx, docker, a, "/root/drift.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "reconciled"),
+			"/root/drift.txt records the operator calling the role reconciled",
+			detailOr("file not found on any node", firstLine(body), !found)))
+		checks = append(checks, boolCheck(canLogin && isReconciled && healthy,
+			"And a later change to the spec put the LOGIN back",
+			fmt.Sprintf("rolcanlogin is %v; reconciled: %v", canLogin, reconciled)))
+		return finish(checks), nil
+
+	case "remove-it":
+		var checks []CheckItem
+		absent := wanted != nil && wanted.Ensure == "absent"
+		checks = append(checks, boolCheck(absent,
+			"The Cluster asks for the role to be absent",
+			detailOr("ensure is not absent", "ensure: absent", !absent)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/cannot-drop.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "objects in database"),
+			"/root/cannot-drop.txt records why the first attempt could not be carried out",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		checks = append(checks, boolCheck(!exists,
+			"The role is gone from the database now that nothing depends on it",
+			detailOr("analyst still exists", "no analyst role in pg_roles", exists)))
+		checks = append(checks, boolCheck(len(problems) == 0 && healthy,
+			"And the operator reports nothing it cannot reconcile",
+			fmt.Sprintf("problems: %v, %s", problems, c.Status.Phase)))
+		return finish(checks), nil
+	}
+	_ = comment
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-managed-roles", taskID)
+}
+
+/* ---- Lab 64: Password maintenance with Kubernetes Secrets ---- */
+
+// secretView is what the password lab needs off a Secret: the password it holds, the
+// resourceVersion the operator compares against, and whether it carries the label that puts it
+// in the operator's watch set at all.
+type secretView struct {
+	password string
+	rv       string
+	reload   bool
+	found    bool
+}
+
+func readSecret(ctx context.Context, k3d *K3D, server, name string) secretView {
+	var sec struct {
+		Metadata struct {
+			ResourceVersion string            `json:"resourceVersion"`
+			Labels          map[string]string `json:"labels"`
+		} `json:"metadata"`
+		Data map[string]string `json:"data"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &sec, "get", "secret", name); err != nil {
+		return secretView{}
+	}
+	pw, _ := base64.StdEncoding.DecodeString(sec.Data["password"])
+	return secretView{
+		password: string(pw),
+		rv:       sec.Metadata.ResourceVersion,
+		reload:   sec.Metadata.Labels["cnpg.io/reload"] == "true",
+		found:    true,
+	}
+}
+
+// passwordStatusOf reads what the operator says it last applied for one role. The
+// resourceVersion here is the Secret version it acted on — the whole lab turns on comparing it
+// with the Secret's current one.
+func passwordStatusOf(ctx context.Context, k3d *K3D, server, cluster, role string) (rv string, txID int64, present bool) {
+	var c struct {
+		Status struct {
+			ManagedRolesStatus struct {
+				PasswordStatus map[string]struct {
+					ResourceVersion string `json:"resourceVersion"`
+					TransactionID   int64  `json:"transactionID"`
+				} `json:"passwordStatus"`
+			} `json:"managedRolesStatus"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &c, "get", "cluster.postgresql.cnpg.io", cluster); err != nil {
+		return "", 0, false
+	}
+	st, ok := c.Status.ManagedRolesStatus.PasswordStatus[role]
+	return st.ResourceVersion, st.TransactionID, ok
+}
+
+// rolePassword reads the two things pg_authid knows about a role's password: whether there is
+// one at all, and when it stops being valid.
+func rolePassword(ctx context.Context, docker *Docker, server, pod, role string) (noPassword bool, validUntil string, found bool) {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres", fmt.Sprintf(
+		"SELECT (rolpassword IS NULL) || '|' || coalesce(rolvaliduntil::text, '') FROM pg_authid WHERE rolname = '%s';", role))
+	if err != nil || !res.ok() || strings.TrimSpace(res.stdout) == "" {
+		return false, "", false
+	}
+	parts := strings.SplitN(strings.TrimSpace(res.stdout), "|", 2)
+	if len(parts) < 2 {
+		return false, "", true
+	}
+	return strings.HasPrefix(parts[0], "t"), parts[1], true
+}
+
+// twoDifferentLines is how /root/not-rotated.txt is graded: the learner captures the Secret's
+// resourceVersion and the one the operator had applied, and the point of the objective is that
+// at that moment they disagreed.
+func twoDifferentLines(body string) (a, b string, ok bool) {
+	var lines []string
+	for _, l := range strings.Split(body, "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines = append(lines, strings.TrimSpace(l))
+		}
+	}
+	if len(lines) < 2 {
+		return "", "", false
+	}
+	return lines[0], lines[1], lines[0] != lines[1]
+}
+
+func checkRolePasswords(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	const role = "analyst"
+	const secretName = "analyst-password"
+	const oldPassword = "analyst_pw"   // what the environment created the role with
+	const newPassword = "analyst_2026" // what the lab rotates to
+	const sqlPassword = "out_of_band"  // what the learner sets behind the operator's back
+
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	sec := readSecret(ctx, k3d, server, secretName)
+	appliedRV, txID, hasStatus := passwordStatusOf(ctx, k3d, server, cluster, role)
+	declared, reconciled, problems := readManagedRoles(ctx, k3d, server, cluster)
+
+	var wanted *managedRole
+	for i, r := range declared {
+		if r.Name == role {
+			wanted = &declared[i]
+		}
+	}
+	isReconciled := false
+	for _, n := range reconciled {
+		if n == role {
+			isReconciled = true
+		}
+	}
+	connects := func(password string) sqlResult {
+		return psqlAsUser(ctx, docker, server, cluster+"-rw", role, password, "app", "SELECT 1;")
+	}
+
+	switch taskID {
+	case "rotate-the-secret":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(sec.found && sec.password == newPassword,
+			"The Secret holds the new password",
+			detailOr("the Secret does not hold "+newPassword, "password is "+newPassword, !sec.found || sec.password != newPassword)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/not-rotated.txt")
+		secretRV, applied, differ := twoDifferentLines(body)
+		checks = append(checks, boolCheck(found && differ,
+			"/root/not-rotated.txt caught the two versions disagreeing",
+			detailOr("file not found on any node",
+				fmt.Sprintf("Secret at %q, operator had applied %q", secretRV, applied), !found)))
+
+		checks = append(checks, boolCheck(sec.reload,
+			"The Secret carries cnpg.io/reload, which is what puts it in the operator's watch set",
+			detailOr("no cnpg.io/reload label on the Secret", "cnpg.io/reload is true", !sec.reload)))
+
+		newOK := connects(newPassword).ok()
+		oldOK := connects(oldPassword).ok()
+		checks = append(checks, boolCheck(newOK && !oldOK,
+			"And the operator has applied it — the new password works, the old one is refused",
+			fmt.Sprintf("new password connects: %v, old password connects: %v", newOK, oldOK)))
+		return finish(checks), nil
+
+	case "changed-in-sql":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/sql-password.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "reconciled"),
+			"/root/sql-password.txt records the operator calling the role reconciled while the passwords disagreed",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		secretOK := connects(newPassword).ok()
+		sqlOK := connects(sqlPassword).ok()
+		checks = append(checks, boolCheck(secretOK,
+			"The Secret's password is back in force",
+			fmt.Sprintf("connecting with the Secret's password: %v", secretOK)))
+		checks = append(checks, boolCheck(!sqlOK,
+			"And the one set in SQL no longer gets in",
+			fmt.Sprintf("connecting with the out-of-band password: %v", sqlOK)))
+		checks = append(checks, boolCheck(hasStatus && appliedRV == sec.rv && appliedRV != "",
+			"Because the operator re-read the Secret it watches",
+			fmt.Sprintf("Secret at %q, operator applied %q (transaction %d)", sec.rv, appliedRV, txID)))
+		return finish(checks), nil
+
+	case "expire-and-disable":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/expired.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "password authentication failed"),
+			"/root/expired.txt records what PostgreSQL says about an expired password",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		disabled := wanted != nil && wanted.DisablePassword != nil && *wanted.DisablePassword && wanted.PasswordSecret.Name == ""
+		checks = append(checks, boolCheck(disabled,
+			"The Cluster asks for the password to be disabled, with no Secret alongside it",
+			detailOr("disablePassword is not set on its own",
+				"disablePassword: true, no passwordSecret", !disabled)))
+
+		noPassword, validUntil, exists := rolePassword(ctx, docker, server, c.Status.CurrentPrimary, role)
+		checks = append(checks, boolCheck(exists && noPassword,
+			"And the role's password really is NULL in pg_authid",
+			detailOr("the role still has a password",
+				fmt.Sprintf("rolpassword is NULL, rolvaliduntil %q", validUntil), !exists || !noPassword)))
+
+		secretOK := connects(newPassword).ok()
+		checks = append(checks, boolCheck(!secretOK && isReconciled && healthy && len(problems) == 0,
+			"No password gets in, and the operator still reports the role reconciled",
+			fmt.Sprintf("Secret password connects: %v, reconciled: %v, %s", secretOK, reconciled, c.Status.Phase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-role-passwords", taskID)
+}
+
+/* ---- Labs 65-68: tablespaces and declarative databases ---- */
+
+// tablespaceEntry is one entry of spec.tablespaces, read back off the Cluster after the webhook
+// has filled in the fields nobody wrote.
+type tablespaceEntry struct {
+	Name  string `json:"name"`
+	Owner struct {
+		Name string `json:"name"`
+	} `json:"owner"`
+	Temporary bool `json:"temporary"`
+	Storage   struct {
+		Size string `json:"size"`
+	} `json:"storage"`
+}
+
+// readTablespaces returns what the Cluster declares and what the operator says it did about it.
+func readTablespaces(ctx context.Context, k3d *K3D, server, cluster string) ([]tablespaceEntry, map[string]string) {
+	var c struct {
+		Spec struct {
+			Tablespaces []tablespaceEntry `json:"tablespaces"`
+		} `json:"spec"`
+		Status struct {
+			TablespacesStatus []struct {
+				Name  string `json:"name"`
+				State string `json:"state"`
+			} `json:"tablespacesStatus"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &c, "get", "cluster.postgresql.cnpg.io", cluster); err != nil {
+		return nil, nil
+	}
+	states := map[string]string{}
+	for _, t := range c.Status.TablespacesStatus {
+		states[t.Name] = t.State
+	}
+	return c.Spec.Tablespaces, states
+}
+
+func tablespaceByName(list []tablespaceEntry, name string) (tablespaceEntry, bool) {
+	for _, t := range list {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return tablespaceEntry{}, false
+}
+
+// tablespaceClaims maps a tablespace name to the claims carrying its data — one per instance,
+// labelled by the operator with the tablespace they belong to.
+func tablespaceClaims(ctx context.Context, k3d *K3D, server string) map[string][]string {
+	out := map[string][]string{}
+	for _, c := range readClaims(ctx, k3d, server) {
+		if name := c.Metadata.Labels["cnpg.io/tablespaceName"]; name != "" {
+			out[name] = append(out[name], c.Metadata.Name)
+		}
+	}
+	for _, v := range out {
+		sort.Strings(v)
+	}
+	return out
+}
+
+// pgTablespaces reads what PostgreSQL itself knows: name and location, which is the only thing
+// that settles whether a declaration became a tablespace.
+func pgTablespaces(ctx context.Context, docker *Docker, server, pod string) map[string]string {
+	out := map[string]string{}
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres",
+		"SELECT spcname || '|' || coalesce(pg_tablespace_location(oid), '') FROM pg_tablespace ORDER BY spcname;")
+	if err != nil || !res.ok() {
+		return out
+	}
+	for _, line := range strings.Split(res.stdout, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "|", 2)
+		if len(parts) == 2 {
+			out[parts[0]] = parts[1]
+		}
+	}
+	return out
+}
+
+// tableTablespace returns which tablespace a table lives in, per PostgreSQL.
+func tableTablespace(ctx context.Context, docker *Docker, server, pod, table string) string {
+	res, err := psqlSuper(ctx, docker, server, pod, "app",
+		fmt.Sprintf("SELECT coalesce(tablespace, 'pg_default') FROM pg_tables WHERE tablename = '%s';", table))
+	if err != nil || !res.ok() {
+		return ""
+	}
+	return strings.TrimSpace(res.stdout)
+}
+
+// tempStats reads one instance's own temporary-file counters. They are per-instance — a standby
+// counts the spills it served, and nothing is replicated.
+func tempStats(ctx context.Context, docker *Docker, server, pod string) (files int, bytes int64) {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres",
+		"SELECT temp_files || '|' || temp_bytes FROM pg_stat_database WHERE datname = 'app';")
+	if err != nil || !res.ok() {
+		return 0, 0
+	}
+	parts := strings.SplitN(strings.TrimSpace(res.stdout), "|", 2)
+	if len(parts) < 2 {
+		return 0, 0
+	}
+	f, _ := strconv.Atoi(parts[0])
+	b, _ := strconv.ParseInt(parts[1], 10, 64)
+	return f, b
+}
+
+func checkTablespaces(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, pods, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	declared, states := readTablespaces(ctx, k3d, server, cluster)
+	claims := tablespaceClaims(ctx, k3d, server)
+	spaces := pgTablespaces(ctx, docker, server, c.Status.CurrentPrimary)
+
+	_, hasReporting := tablespaceByName(declared, "reporting")
+	_, hasArchive := tablespaceByName(declared, "archive")
+	bothReconciled := states["reporting"] == "reconciled" && states["archive"] == "reconciled"
+
+	switch taskID {
+	case "declare-them":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(hasReporting && hasArchive,
+			"The Cluster declares the reporting and archive tablespaces",
+			fmt.Sprintf("%d declared: %v", len(declared), tablespaceNames(declared))))
+		checks = append(checks, boolCheck(bothReconciled && healthy,
+			"Both report reconciled, on a healthy cluster",
+			fmt.Sprintf("reporting=%s archive=%s, %s", detailOr("(absent)", states["reporting"], states["reporting"] == ""),
+				detailOr("(absent)", states["archive"], states["archive"] == ""), c.Status.Phase)))
+		checks = append(checks, boolCheck(len(claims["reporting"]) == 3 && len(claims["archive"]) == 3,
+			"Every instance has its own volume for each of them",
+			fmt.Sprintf("reporting: %d claim(s), archive: %d claim(s)", len(claims["reporting"]), len(claims["archive"]))))
+		bothInPG := spaces["reporting"] != "" && spaces["archive"] != ""
+		checks = append(checks, boolCheck(bothInPG,
+			"And PostgreSQL knows about both, with their own locations",
+			detailOr("pg_tablespace does not have both",
+				fmt.Sprintf("reporting at %s", spaces["reporting"]), !bothInPG)))
+		return finish(checks), nil
+
+	case "put-a-table-in-one":
+		var checks []CheckItem
+		where := tableTablespace(ctx, docker, server, c.Status.CurrentPrimary, "quarterly")
+		checks = append(checks, boolCheck(where == "reporting",
+			"A table called quarterly lives in the reporting tablespace",
+			detailOr("no quarterly table on the primary", "pg_tables says "+where, where == "")))
+
+		rows, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", "SELECT count(*) FROM quarterly;")
+		checks = append(checks, boolCheck(rows.count() == 1000,
+			"It holds 1000 rows",
+			fmt.Sprintf("%d row(s)", rows.count())))
+
+		links, _ := execInPod(ctx, docker, server, c.Status.CurrentPrimary,
+			"sh", "-c", "ls -l /var/lib/postgresql/data/pgdata/pg_tblspc/")
+		linked := strings.Contains(links, "/var/lib/postgresql/tablespaces/reporting/data")
+		checks = append(checks, boolCheck(linked,
+			"Its files really are under /var/lib/postgresql/tablespaces/reporting on the primary",
+			detailOr("pg_tblspc has no link to the reporting mount", firstLine(links), !linked)))
+
+		replicasOK, detail := 0, []string{}
+		for _, p := range replicaPods(c, pods) {
+			r, _ := psqlSuper(ctx, docker, server, p, "app", "SELECT count(*) FROM quarterly;")
+			if r.count() == 1000 && tableTablespace(ctx, docker, server, p, "quarterly") == "reporting" {
+				replicasOK++
+			}
+			detail = append(detail, fmt.Sprintf("%s: %d", p, r.count()))
+		}
+		checks = append(checks, boolCheck(replicasOK == 2,
+			"And every replica has the same rows in its own copy of the tablespace",
+			strings.Join(detail, ", ")))
+		return finish(checks), nil
+
+	case "no-taking-it-back":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/no-delete.txt")
+		refused := found && strings.Contains(body, "no tablespace can be deleted once created")
+		checks = append(checks, boolCheck(refused,
+			"/root/no-delete.txt records the operator refusing to remove one",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		checks = append(checks, boolCheck(hasReporting && hasArchive && bothReconciled,
+			"Both tablespaces are still declared, and still reconciled",
+			fmt.Sprintf("declared: %v, states: reporting=%s archive=%s", tablespaceNames(declared),
+				states["reporting"], states["archive"])))
+
+		arch, _ := tablespaceByName(declared, "archive")
+		defaulted := arch.Owner.Name != "" && !arch.Temporary
+		checks = append(checks, boolCheck(defaulted,
+			"The owner the webhook filled in is on the tablespace nobody gave one to",
+			fmt.Sprintf("archive owner is %q, temporary %v", arch.Owner.Name, arch.Temporary)))
+
+		rows, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", "SELECT count(*) FROM quarterly;")
+		checks = append(checks, boolCheck(rows.count() == 1000 && healthy,
+			"And the table inside one of them is still readable",
+			fmt.Sprintf("%d row(s), %s", rows.count(), c.Status.Phase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-tablespaces", taskID)
+}
+
+func tablespaceNames(list []tablespaceEntry) []string {
+	out := make([]string, 0, len(list))
+	for _, t := range list {
+		out = append(out, t.Name)
+	}
+	return out
+}
+
+func checkTemporaryTablespaces(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, pods, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	declared, states := readTablespaces(ctx, k3d, server, cluster)
+	scratch, hasScratch := tablespaceByName(declared, "scratch")
+	claims := tablespaceClaims(ctx, k3d, server)
+
+	tempGUC := func(pod string) string {
+		res, err := psqlSuper(ctx, docker, server, pod, "postgres", "SHOW temp_tablespaces;")
+		if err != nil || !res.ok() {
+			return ""
+		}
+		return strings.TrimSpace(res.stdout)
+	}
+
+	switch taskID {
+	case "declare-a-temporary-one":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(hasScratch && scratch.Temporary,
+			"The Cluster declares scratch as a temporary tablespace",
+			fmt.Sprintf("declared: %v, temporary: %v", tablespaceNames(declared), scratch.Temporary)))
+		checks = append(checks, boolCheck(states["scratch"] == "reconciled" && healthy,
+			"It reports reconciled, on a healthy cluster",
+			fmt.Sprintf("state %q, %s", states["scratch"], c.Status.Phase)))
+		checks = append(checks, boolCheck(len(claims["scratch"]) == 3,
+			"Every instance has its own volume for it",
+			fmt.Sprintf("%d claim(s): %v", len(claims["scratch"]), claims["scratch"])))
+
+		onAll, detail := 0, []string{}
+		for _, p := range pods.Items {
+			g := tempGUC(p.Metadata.Name)
+			if g == "scratch" {
+				onAll++
+			}
+			detail = append(detail, fmt.Sprintf("%s: %q", p.Metadata.Name, g))
+		}
+		checks = append(checks, boolCheck(onAll == len(pods.Items) && onAll > 0,
+			"And temp_tablespaces names it on every instance, not just the primary",
+			strings.Join(detail, ", ")))
+		return finish(checks), nil
+
+	case "where-temp-objects-go":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/temp-table.txt")
+		landed := found && strings.Contains(body, "scratch")
+		checks = append(checks, boolCheck(landed,
+			"/root/temp-table.txt shows a temporary table landing in scratch",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		files, bytes := tempStats(ctx, docker, server, c.Status.CurrentPrimary)
+		checks = append(checks, boolCheck(files > 0,
+			"The primary has written temporary files for the app database",
+			fmt.Sprintf("temp_files %d", files)))
+		checks = append(checks, boolCheck(bytes > 10<<20,
+			"And enough of them that the sort really spilled to disk",
+			fmt.Sprintf("temp_bytes %d", bytes)))
+
+		// The data directory keeps a pgsql_tmp of its own — PostgreSQL makes it at startup —
+		// and the whole point of the objective is that it stays *empty* while the tablespace
+		// fills up. Counting entries is the honest test; checking the directory is absent is not.
+		out, _ := execInPod(ctx, docker, server, c.Status.CurrentPrimary,
+			"sh", "-c", "ls -1 /var/lib/postgresql/data/pgdata/base/pgsql_tmp 2>/dev/null | wc -l")
+		emptyInData := strings.TrimSpace(out) == "0"
+		checks = append(checks, boolCheck(emptyInData && healthy,
+			"While the data directory's own pgsql_tmp stayed empty",
+			fmt.Sprintf("%q entries in base/pgsql_tmp, %s", firstLine(out), c.Status.Phase)))
+		return finish(checks), nil
+
+	case "the-standbys-spill-too":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/replica-spill.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "temp_files"),
+			"/root/replica-spill.txt records a standby's own temporary-file counters",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		spilled, detail := 0, []string{}
+		for _, p := range replicaPods(c, pods) {
+			f, b := tempStats(ctx, docker, server, p)
+			if f > 0 && b > 1<<20 {
+				spilled++
+			}
+			detail = append(detail, fmt.Sprintf("%s: %d file(s), %d bytes", p, f, b))
+		}
+		checks = append(checks, boolCheck(spilled >= 1,
+			"A standby has written temporary files of its own",
+			strings.Join(detail, ", ")))
+		checks = append(checks, boolCheck(len(claims["scratch"]) == 3,
+			"Each standby has its own scratch volume to write them to",
+			fmt.Sprintf("%d claim(s): %v", len(claims["scratch"]), claims["scratch"])))
+		checks = append(checks, boolCheck(healthy && states["scratch"] == "reconciled",
+			"And the cluster is healthy throughout",
+			fmt.Sprintf("%s, scratch %s", c.Status.Phase, states["scratch"])))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-temporary-tablespaces", taskID)
+}
+
+// databaseObj is a Database resource as the two declarative-database labs read it.
+type databaseObj struct {
+	Metadata struct {
+		Name              string   `json:"name"`
+		Finalizers        []string `json:"finalizers"`
+		DeletionTimestamp string   `json:"deletionTimestamp"`
+	} `json:"metadata"`
+	Spec struct {
+		Name                  string `json:"name"`
+		Owner                 string `json:"owner"`
+		Ensure                string `json:"ensure"`
+		DatabaseReclaimPolicy string `json:"databaseReclaimPolicy"`
+		Cluster               struct {
+			Name string `json:"name"`
+		} `json:"cluster"`
+	} `json:"spec"`
+	Status struct {
+		Applied            *bool  `json:"applied"`
+		Message            string `json:"message"`
+		ObservedGeneration int64  `json:"observedGeneration"`
+	} `json:"status"`
+}
+
+func (d databaseObj) isApplied() bool { return d.Status.Applied != nil && *d.Status.Applied }
+
+func readDatabases(ctx context.Context, k3d *K3D, server string) []databaseObj {
+	var list struct {
+		Items []databaseObj `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "database.postgresql.cnpg.io"); err != nil {
+		return nil
+	}
+	sort.Slice(list.Items, func(i, j int) bool { return list.Items[i].Metadata.Name < list.Items[j].Metadata.Name })
+	return list.Items
+}
+
+func databaseByObject(list []databaseObj, name string) (databaseObj, bool) {
+	for _, d := range list {
+		if d.Metadata.Name == name {
+			return d, true
+		}
+	}
+	return databaseObj{}, false
+}
+
+// pgDatabase answers what PostgreSQL has, which is the only thing a reclaim policy is about.
+func pgDatabase(ctx context.Context, docker *Docker, server, pod, name string) (exists bool, owner string) {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres", fmt.Sprintf(
+		"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '%s';", name))
+	if err != nil || !res.ok() || strings.TrimSpace(res.stdout) == "" {
+		return false, ""
+	}
+	return true, strings.TrimSpace(res.stdout)
+}
+
+func checkDeclarativeDatabases(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	dbs := readDatabases(ctx, k3d, server)
+	obj, hasObj := databaseByObject(dbs, "reporting-db")
+	exists, owner := pgDatabase(ctx, docker, server, c.Status.CurrentPrimary, "reporting")
+
+	switch taskID {
+	case "declare-a-database":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(hasObj && obj.isApplied(),
+			"A Database object called reporting-db reports applied",
+			detailOr("no reporting-db object", fmt.Sprintf("applied %v, message %q", obj.isApplied(), obj.Status.Message), !hasObj)))
+		checks = append(checks, boolCheck(exists && owner == "app",
+			"The reporting database exists in PostgreSQL, owned by app",
+			detailOr("no reporting database", "owner is "+owner, !exists)))
+		checks = append(checks, boolCheck(obj.Spec.DatabaseReclaimPolicy == "retain" && obj.Spec.Ensure == "present",
+			"Its reclaim policy is retain — the default nobody wrote",
+			fmt.Sprintf("databaseReclaimPolicy %q, ensure %q", obj.Spec.DatabaseReclaimPolicy, obj.Spec.Ensure)))
+		hasFinalizer := false
+		for _, f := range obj.Metadata.Finalizers {
+			if f == "cnpg.io/deleteDatabase" {
+				hasFinalizer = true
+			}
+		}
+		checks = append(checks, boolCheck(hasFinalizer && healthy,
+			"And the object carries the cnpg.io/deleteDatabase finalizer",
+			fmt.Sprintf("finalizers %v, %s", obj.Metadata.Finalizers, c.Status.Phase)))
+		return finish(checks), nil
+
+	case "one-object-owns-it":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/already-managed.txt")
+		refused := found && strings.Contains(body, "already managed by object")
+		checks = append(checks, boolCheck(refused,
+			"/root/already-managed.txt records the second object being turned away",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		_, dupStillThere := databaseByObject(dbs, "reporting-dup")
+		checks = append(checks, boolCheck(!dupStillThere,
+			"The duplicate object has been removed again",
+			detailOr("reporting-dup is still there", "no reporting-dup object", dupStillThere)))
+
+		checks = append(checks, boolCheck(hasObj && obj.isApplied() && obj.Status.Message == "",
+			"The original is still applied, with nothing to report",
+			fmt.Sprintf("applied %v, message %q", obj.isApplied(), obj.Status.Message)))
+
+		rows, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "reporting", "SELECT count(*) FROM ledger;")
+		checks = append(checks, boolCheck(rows.count() == 3,
+			"And the table you created inside the database holds 3 rows",
+			fmt.Sprintf("%d row(s)", rows.count())))
+		return finish(checks), nil
+
+	case "delete-the-object-keep-the-database":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/retained.txt")
+		kept := found && strings.Contains(body, "reporting")
+		checks = append(checks, boolCheck(kept,
+			"/root/retained.txt records the database still there after the object went",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		checks = append(checks, boolCheck(exists && owner == "app",
+			"The reporting database survived the deletion",
+			detailOr("no reporting database", "owner is "+owner, !exists)))
+
+		rows, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "reporting", "SELECT count(*) FROM ledger;")
+		checks = append(checks, boolCheck(rows.count() == 3,
+			"With its table and rows untouched",
+			fmt.Sprintf("%d row(s)", rows.count())))
+
+		checks = append(checks, boolCheck(hasObj && obj.isApplied() && healthy,
+			"And a Database object declaring it again has adopted it",
+			fmt.Sprintf("applied %v, message %q, %s", obj.isApplied(), obj.Status.Message, c.Status.Phase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-declarative-databases", taskID)
+}
+
+func checkDatabaseReclaim(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	dbs := readDatabases(ctx, k3d, server)
+	tempObj, hasTemp := databaseByObject(dbs, "temp-db")
+	keepObj, hasKeep := databaseByObject(dbs, "keep-db")
+	tempExists, _ := pgDatabase(ctx, docker, server, c.Status.CurrentPrimary, "tempdb")
+	keepExists, keepOwner := pgDatabase(ctx, docker, server, c.Status.CurrentPrimary, "keepdb")
+
+	switch taskID {
+	case "two-policies":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(hasTemp && tempObj.isApplied() && hasKeep && keepObj.isApplied(),
+			"Both Database objects report applied",
+			fmt.Sprintf("temp-db applied %v, keep-db applied %v", tempObj.isApplied(), keepObj.isApplied())))
+		checks = append(checks, boolCheck(tempExists && keepExists && keepOwner == "app",
+			"Both databases exist in PostgreSQL",
+			fmt.Sprintf("tempdb %v, keepdb %v", tempExists, keepExists)))
+		checks = append(checks, boolCheck(tempObj.Spec.DatabaseReclaimPolicy == "delete",
+			"tempdb is declared with the delete reclaim policy",
+			fmt.Sprintf("policy %q", tempObj.Spec.DatabaseReclaimPolicy)))
+		checks = append(checks, boolCheck(keepObj.Spec.DatabaseReclaimPolicy == "retain" && healthy,
+			"And keepdb with retain, so the two can be compared",
+			fmt.Sprintf("policy %q, %s", keepObj.Spec.DatabaseReclaimPolicy, c.Status.Phase)))
+		return finish(checks), nil
+
+	case "delete-takes-it-with-it":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/blocked.txt")
+		blocked := found && strings.Contains(body, "deletionTimestamp")
+		checks = append(checks, boolCheck(blocked,
+			"/root/blocked.txt records the object waiting on its finalizer, with a deletionTimestamp",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		checks = append(checks, boolCheck(!hasTemp,
+			"The temp-db object is gone now that nothing is connected",
+			detailOr("temp-db is still there", "no temp-db object", hasTemp)))
+		checks = append(checks, boolCheck(!tempExists,
+			"And tempdb went with it — that is what delete means",
+			detailOr("tempdb still exists", "no tempdb in pg_database", tempExists)))
+		checks = append(checks, boolCheck(keepExists && hasKeep && healthy,
+			"While keepdb, on the other policy, is untouched",
+			fmt.Sprintf("keepdb %v, keep-db object %v, %s", keepExists, hasKeep, c.Status.Phase)))
+		return finish(checks), nil
+
+	case "absent-is-not-the-same":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(hasKeep && keepObj.Spec.Ensure == "absent",
+			"The keep-db object now asks for the database to be absent",
+			detailOr("keep-db does not ask for absent", "ensure: absent", !hasKeep || keepObj.Spec.Ensure != "absent")))
+		checks = append(checks, boolCheck(!keepExists,
+			"keepdb has been dropped",
+			detailOr("keepdb still exists", "no keepdb in pg_database", keepExists)))
+		checks = append(checks, boolCheck(hasKeep && keepObj.isApplied(),
+			"But the object is still there, and still reports applied",
+			fmt.Sprintf("object present %v, applied %v", hasKeep, keepObj.isApplied())))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/absent.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "keep-db") && healthy,
+			"And /root/absent.txt records the object outliving its database",
+			detailOr("file not found on any node", firstLine(body), !found)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-database-reclaim", taskID)
+}
+
+/* ---- Lab 69: backing up and restoring a cluster with tablespaces ---- */
+
+// backupWAL reads what a completed Backup says about where it begins, which is the segment the
+// archive has to contain before that backup can be restored at all.
+func backupWAL(ctx context.Context, k3d *K3D, server string) (name, phase, beginWal string) {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Status struct {
+				Phase    string `json:"phase"`
+				BeginWal string `json:"beginWal"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "backup"); err != nil || len(list.Items) == 0 {
+		return "", "", ""
+	}
+	b := list.Items[0]
+	return b.Metadata.Name, b.Status.Phase, b.Status.BeginWal
+}
+
+func checkTablespaceBackup(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	_, states := readTablespaces(ctx, k3d, server, cluster)
+
+	switch taskID {
+	case "take-a-backup":
+		var checks []CheckItem
+		name, phase, beginWal := backupWAL(ctx, k3d, server)
+		checks = append(checks, boolCheck(name != "" && phase == "completed",
+			"A backup of the cluster completed",
+			detailOr("no Backup object yet", fmt.Sprintf("%s is %s", name, phase), name == "")))
+		checks = append(checks, boolCheck(beginWal != "",
+			"It records the WAL segment it begins from",
+			detailOr("no beginWal on the backup", "beginWal "+beginWal, beginWal == "")))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/first-wal.txt")
+		named := found && beginWal != "" && strings.Contains(body, beginWal)
+		checks = append(checks, boolCheck(named,
+			"/root/first-wal.txt names that segment",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		// The segment a backup starts in has to be closed before it can be shipped, and an idle
+		// database will sit in it indefinitely — which is what makes an apparently completed
+		// backup unrestorable. Comparing the current segment with the backup's is the check.
+		cur, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "postgres",
+			"SELECT pg_walfile_name(pg_current_wal_lsn());")
+		current := strings.TrimSpace(cur.stdout)
+		moved := current != "" && beginWal != "" && current > beginWal
+		archiving, _ := clusterConditionOf(ctx, k3d, server, cluster, "ContinuousArchiving")
+		checks = append(checks, boolCheck(moved && archiving == "True" && healthy,
+			"And the database has moved past it, so the archive has the whole segment",
+			fmt.Sprintf("backup begins in %s, the primary is now writing %s, ContinuousArchiving %s",
+				beginWal, current, archiving)))
+		return finish(checks), nil
+
+	case "forget-the-tablespaces":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/forgot.txt")
+		refused := found && strings.Contains(body, "Read-only file system") &&
+			strings.Contains(body, "/var/lib/postgresql/tablespaces")
+		checks = append(checks, boolCheck(refused,
+			"/root/forgot.txt records the restore failing on a read-only /var/lib/postgresql/tablespaces",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		phaseBody, phaseFound := readFileAnyNode(ctx, docker, a, "/root/forgot-phase.txt")
+		stuck := phaseFound && strings.Contains(phaseBody, "Setting up primary")
+		checks = append(checks, boolCheck(stuck,
+			"/root/forgot-phase.txt shows it stuck at Setting up primary, never becoming an instance",
+			detailOr("file not found on any node", firstLine(phaseBody), !phaseFound)))
+
+		_, _, gone := clusterPhase(ctx, k3d, server, "pg-forgot")
+		checks = append(checks, boolCheck(!gone,
+			"The failed cluster has been removed again",
+			detailOr("pg-forgot is still there", "no pg-forgot cluster", gone)))
+
+		rows, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", "SELECT count(*) FROM quarterly;")
+		checks = append(checks, boolCheck(rows.count() == 500 && healthy && states["reporting"] == "reconciled",
+			"And the cluster it was recovering from never noticed",
+			fmt.Sprintf("%d row(s), %s, reporting %s", rows.count(), c.Status.Phase, states["reporting"])))
+		return finish(checks), nil
+
+	case "recover-with-them":
+		var checks []CheckItem
+		phase, ready, exists := clusterPhase(ctx, k3d, server, "pg-restored")
+		checks = append(checks, boolCheck(exists && phase == "Cluster in healthy state" && ready == 1,
+			"A cluster named pg-restored reports healthy",
+			detailOr("pg-restored does not exist yet", fmt.Sprintf("%s, %d/1 ready", phase, ready), !exists)))
+
+		claims := tablespaceClaims(ctx, k3d, server)
+		own := false
+		for _, n := range claims["reporting"] {
+			if n == "pg-restored-1-tbs-reporting" {
+				own = true
+			}
+		}
+		checks = append(checks, boolCheck(own,
+			"It has a volume of its own for the reporting tablespace",
+			fmt.Sprintf("claims for reporting: %v", claims["reporting"])))
+
+		rows, _ := psqlSuper(ctx, docker, server, "pg-restored-1", "app", "SELECT count(*) FROM quarterly;")
+		where := tableTablespace(ctx, docker, server, "pg-restored-1", "quarterly")
+		checks = append(checks, boolCheck(rows.count() == 500 && where == "reporting",
+			"The quarterly table is there, still in that tablespace, with its 500 rows",
+			fmt.Sprintf("%d row(s), tablespace %q", rows.count(), where)))
+
+		src, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", "SELECT count(*) FROM quarterly;")
+		checks = append(checks, boolCheck(src.count() == 500 && healthy,
+			"And the cluster it was recovered from is untouched",
+			fmt.Sprintf("%d row(s), %s", src.count(), c.Status.Phase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-tablespace-backup", taskID)
+}
+
+/* ---- Lab 70: snapshot backup and recovery of a cluster with tablespaces ---- */
+
+// snapshotRow is a VolumeSnapshot as the tablespace-snapshot lab reads it: whether it is usable,
+// which claim it came from, and which tablespace it holds if it holds one.
+type snapshotRow struct {
+	name       string
+	ready      bool
+	sourcePVC  string
+	tablespace string
+}
+
+func readSnapshots(ctx context.Context, k3d *K3D, server string) []snapshotRow {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name   string            `json:"name"`
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+			Spec struct {
+				Source struct {
+					PersistentVolumeClaimName string `json:"persistentVolumeClaimName"`
+				} `json:"source"`
+			} `json:"spec"`
+			Status struct {
+				ReadyToUse *bool `json:"readyToUse"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &list, "get", "volumesnapshot"); err != nil {
+		return nil
+	}
+	var out []snapshotRow
+	for _, s := range list.Items {
+		out = append(out, snapshotRow{
+			name:       s.Metadata.Name,
+			ready:      s.Status.ReadyToUse != nil && *s.Status.ReadyToUse,
+			sourcePVC:  s.Spec.Source.PersistentVolumeClaimName,
+			tablespace: s.Metadata.Labels["cnpg.io/tablespaceName"],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+func snapshotByName(list []snapshotRow, name string) (snapshotRow, bool) {
+	for _, s := range list {
+		if s.name == name {
+			return s, true
+		}
+	}
+	return snapshotRow{}, false
+}
+
+func snapshotNamesOf(list []snapshotRow) []string {
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		out = append(out, s.name)
+	}
+	return out
+}
+
+func checkTablespaceSnapshot(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const backupName = "daily-snapshot"
+	const tbsSnapshot = backupName + "-tbs-reporting"
+	c, _, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 1
+	snaps := readSnapshots(ctx, k3d, server)
+
+	switch taskID {
+	case "snapshot-every-volume":
+		var checks []CheckItem
+		backups := readBackups(ctx, k3d, server)
+		done := false
+		for _, b := range backups {
+			if b.name == backupName && b.phase == "completed" {
+				done = true
+			}
+		}
+		checks = append(checks, boolCheck(done,
+			"The volumeSnapshot backup completed",
+			fmt.Sprintf("%d backup(s): %v", len(backups), backups)))
+
+		data, hasData := snapshotByName(snaps, backupName)
+		tbs, hasTbs := snapshotByName(snaps, tbsSnapshot)
+		checks = append(checks, boolCheck(hasData && hasTbs,
+			"It produced one VolumeSnapshot per volume, not one for the cluster",
+			fmt.Sprintf("%d snapshot(s): %v", len(snaps), snapshotNamesOf(snaps))))
+		checks = append(checks, boolCheck(hasTbs && tbs.tablespace == "reporting" &&
+			tbs.sourcePVC == "pg-cluster-1-tbs-reporting",
+			"The tablespace's snapshot says which tablespace it holds",
+			fmt.Sprintf("%s: tablespace %q, from claim %q", tbsSnapshot, tbs.tablespace, tbs.sourcePVC)))
+		checks = append(checks, boolCheck(hasData && data.ready && hasTbs && tbs.ready && healthy,
+			"Both are ready to use, and the cluster never stopped serving",
+			fmt.Sprintf("data ready %v, tablespace ready %v, %s", data.ready, tbs.ready, c.Status.Phase)))
+		return finish(checks), nil
+
+	case "forget-the-mapping":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/missing-source.txt")
+		named := found && strings.Contains(body, "missing StorageSource for tablespace")
+		checks = append(checks, boolCheck(named,
+			"/root/missing-source.txt records the operator refusing to create the claims",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		stalledBody, stalledFound := readFileAnyNode(ctx, docker, a, "/root/stalled.txt")
+		checks = append(checks, boolCheck(stalledFound && strings.Contains(stalledBody, "pg-half"),
+			"/root/stalled.txt records the half-mapped cluster with nothing running",
+			detailOr("file not found on any node", firstLine(stalledBody), !stalledFound)))
+
+		_, _, stillThere := clusterPhase(ctx, k3d, server, "pg-half")
+		checks = append(checks, boolCheck(!stillThere,
+			"The half-mapped cluster has been removed again",
+			detailOr("pg-half is still there", "no pg-half cluster", stillThere)))
+
+		rows, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", "SELECT count(*) FROM quarterly;")
+		checks = append(checks, boolCheck(rows.count() == 500 && healthy,
+			"And nothing was taken from the cluster you snapshotted",
+			fmt.Sprintf("%d row(s), %s", rows.count(), c.Status.Phase)))
+		return finish(checks), nil
+
+	case "map-them-back":
+		var checks []CheckItem
+		phase, ready, exists := clusterPhase(ctx, k3d, server, "pg-restored")
+		checks = append(checks, boolCheck(exists && phase == "Cluster in healthy state" && ready == 1,
+			"A cluster named pg-restored reports healthy",
+			detailOr("pg-restored does not exist yet", fmt.Sprintf("%s, %d/1 ready", phase, ready), !exists)))
+
+		claims := readClaims(ctx, k3d, server)
+		from := func(claimName, snapshot string) bool {
+			cl, ok := claimByName(claims, claimName)
+			return ok && cl.Spec.DataSource != nil && cl.Spec.DataSource.Kind == "VolumeSnapshot" &&
+				cl.Spec.DataSource.Name == snapshot
+		}
+		dataOK := from("pg-restored-1", backupName)
+		tbsOK := from("pg-restored-1-tbs-reporting", tbsSnapshot)
+		checks = append(checks, boolCheck(dataOK,
+			"Its data volume was created from the data snapshot",
+			fmt.Sprintf("pg-restored-1 from %s: %v", backupName, dataOK)))
+		checks = append(checks, boolCheck(tbsOK,
+			"And its tablespace volume from the tablespace's own snapshot",
+			fmt.Sprintf("pg-restored-1-tbs-reporting from %s: %v", tbsSnapshot, tbsOK)))
+
+		rows, _ := psqlSuper(ctx, docker, server, "pg-restored-1", "app", "SELECT count(*) FROM quarterly;")
+		where := tableTablespace(ctx, docker, server, "pg-restored-1", "quarterly")
+		checks = append(checks, boolCheck(rows.count() == 500 && where == "reporting",
+			"With the quarterly table still in the reporting tablespace, all 500 rows",
+			fmt.Sprintf("%d row(s), tablespace %q", rows.count(), where)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-tablespace-snapshot", taskID)
+}
+
+/* ---- Lab 71: declarative major version upgrade ---- */
+
+// pgDataImageInfo is what the operator records about the image that last ran on the data
+// directory — the field it compares against to notice a major version change at all.
+func pgDataMajor(ctx context.Context, k3d *K3D, server, cluster string) (image string, major int) {
+	var c struct {
+		Status struct {
+			Image           string `json:"image"`
+			PGDataImageInfo struct {
+				Image        string `json:"image"`
+				MajorVersion int    `json:"majorVersion"`
+			} `json:"pgDataImageInfo"`
+		} `json:"status"`
+	}
+	if err := kubectlJSON(ctx, k3d, server, &c, "get", "cluster.postgresql.cnpg.io", cluster); err != nil {
+		return "", 0
+	}
+	return c.Status.Image, c.Status.PGDataImageInfo.MajorVersion
+}
+
+// serverVersion is what PostgreSQL itself says, which is the only thing that settles whether an
+// upgrade happened rather than an image tag being edited.
+func serverVersion(ctx context.Context, docker *Docker, server, pod string) string {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres", "SHOW server_version;")
+	if err != nil || !res.ok() {
+		return ""
+	}
+	return strings.TrimSpace(res.stdout)
+}
+
+func showSetting(ctx context.Context, docker *Docker, server, pod, name string) string {
+	res, err := psqlSuper(ctx, docker, server, pod, "postgres", "SHOW "+name+";")
+	if err != nil || !res.ok() {
+		return ""
+	}
+	return strings.TrimSpace(res.stdout)
+}
+
+// tableStats reads the two numbers a major upgrade does not carry across: the planner's row
+// estimate and how many columns have statistics at all.
+func tableStats(ctx context.Context, docker *Docker, server, pod, table string) (reltuples float64, statColumns int) {
+	res, err := psqlSuper(ctx, docker, server, pod, "app", fmt.Sprintf(
+		"SELECT reltuples || '|' || (SELECT count(*) FROM pg_stats WHERE tablename = '%s') FROM pg_class WHERE relname = '%s';",
+		table, table))
+	if err != nil || !res.ok() {
+		return 0, 0
+	}
+	parts := strings.SplitN(strings.TrimSpace(res.stdout), "|", 2)
+	if len(parts) < 2 {
+		return 0, 0
+	}
+	rt, _ := strconv.ParseFloat(parts[0], 64)
+	sc, _ := strconv.Atoi(parts[1])
+	return rt, sc
+}
+
+func checkMajorUpgrade(ctx context.Context, k3d *K3D, docker *Docker, a *Attempt, server, taskID string) (CheckResult, error) {
+	const cluster = "pg-cluster"
+	c, pods, err := readCluster(ctx, k3d, server)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	healthy := c.Status.Phase == "Cluster in healthy state" && c.Status.ReadyInstances == 3
+	image, major := pgDataMajor(ctx, k3d, server, cluster)
+	version := serverVersion(ctx, docker, server, c.Status.CurrentPrimary)
+
+	switch taskID {
+	case "change-the-image":
+		var checks []CheckItem
+		checks = append(checks, boolCheck(strings.HasPrefix(version, "18."),
+			"The primary really is running PostgreSQL 18 now",
+			detailOr("could not read server_version", "server_version is "+version, version == "")))
+		checks = append(checks, boolCheck(major == 18 && strings.Contains(image, "18"),
+			"And the operator records the data directory as major 18",
+			fmt.Sprintf("pgDataImageInfo major %d, image %s", major, image)))
+
+		body, found := readFileAnyNode(ctx, docker, a, "/root/upgrade-job.txt")
+		bothImages := found && strings.Contains(body, "17-system-trixie") &&
+			strings.Contains(body, "18.4-system-trixie")
+		checks = append(checks, boolCheck(bothImages,
+			"/root/upgrade-job.txt shows the upgrade job carrying both PostgreSQL versions",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		rows, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "app", "SELECT count(*) FROM notes;")
+		checks = append(checks, boolCheck(rows.count() == 50 && healthy,
+			"The 50 rows came across, on a healthy 3-instance cluster",
+			fmt.Sprintf("%d row(s), %s, %d/3 ready", rows.count(), c.Status.Phase, c.Status.ReadyInstances)))
+		return finish(checks), nil
+
+	case "kept-and-rebuilt":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/volumes.txt")
+		checks = append(checks, boolCheck(found && strings.Contains(body, "pg-cluster-1"),
+			"/root/volumes.txt records what happened to each instance's volume",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		claims := readClaims(ctx, k3d, server)
+		primaryClaim, okP := claimByName(claims, c.Status.CurrentPrimary)
+		younger, total := 0, 0
+		for _, p := range replicaPods(c, pods) {
+			if cl, ok := claimByName(claims, p); ok {
+				total++
+				if okP && cl.Metadata.CreationTimestamp.After(primaryClaim.Metadata.CreationTimestamp) {
+					younger++
+				}
+			}
+		}
+		checks = append(checks, boolCheck(okP && total == 2 && younger == 2,
+			"The replica volumes are younger than the primary's — they were rebuilt, it was not",
+			fmt.Sprintf("%d of %d replica claim(s) newer than %s", younger, total, primaryClaim.Metadata.Name)))
+
+		refusal, refusalFound := readFileAnyNode(ctx, docker, a, "/root/no-downgrade.txt")
+		refused := refusalFound && strings.Contains(refusal, "can't downgrade from major")
+		checks = append(checks, boolCheck(refused,
+			"/root/no-downgrade.txt records the refusal to go back",
+			detailOr("file not found on any node", firstLine(refusal), !refusalFound)))
+
+		streaming, _ := psqlSuper(ctx, docker, server, c.Status.CurrentPrimary, "postgres",
+			"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';")
+		checks = append(checks, boolCheck(streaming.count() == 2 && healthy,
+			"And both replicas are streaming from the upgraded primary",
+			fmt.Sprintf("%d streaming, %s", streaming.count(), c.Status.Phase)))
+		return finish(checks), nil
+
+	case "what-it-left-behind":
+		var checks []CheckItem
+		body, found := readFileAnyNode(ctx, docker, a, "/root/no-stats.txt")
+		// reltuples of -1 is PostgreSQL's "never analysed", and it is what the upgraded table
+		// reported before the learner ran ANALYZE.
+		noStats := found && strings.Contains(body, "-1")
+		checks = append(checks, boolCheck(noStats,
+			"/root/no-stats.txt records the table with no statistics after the upgrade",
+			detailOr("file not found on any node", firstLine(body), !found)))
+
+		reltuples, statCols := tableStats(ctx, docker, server, c.Status.CurrentPrimary, "notes")
+		checks = append(checks, boolCheck(reltuples > 0 && statCols > 0,
+			"ANALYZE has given the planner its numbers back",
+			fmt.Sprintf("reltuples %.0f, %d column(s) with statistics", reltuples, statCols)))
+
+		freshPhase, freshReady, freshExists := clusterPhase(ctx, k3d, server, "pg-fresh")
+		freshChecksums := ""
+		if freshExists {
+			freshChecksums = showSetting(ctx, docker, server, "pg-fresh-1", "data_checksums")
+		}
+		checks = append(checks, boolCheck(freshExists && freshReady == 1 && freshChecksums == "on",
+			"A freshly bootstrapped PostgreSQL 18 cluster has data checksums on",
+			detailOr("no healthy pg-fresh cluster",
+				fmt.Sprintf("%s, data_checksums %q", freshPhase, freshChecksums), !freshExists || freshReady != 1)))
+
+		upgradedChecksums := showSetting(ctx, docker, server, c.Status.CurrentPrimary, "data_checksums")
+		checks = append(checks, boolCheck(upgradedChecksums == "off" && healthy,
+			"While the upgraded cluster still has them off, as PostgreSQL 17 created it",
+			fmt.Sprintf("data_checksums %q, %s", upgradedChecksums, c.Status.Phase)))
+		return finish(checks), nil
+	}
+	return CheckResult{}, fmt.Errorf("unknown task %q for cnpg-major-upgrade", taskID)
 }
 
 // readCluster is the starting point of nearly every check below: the live Cluster resource,

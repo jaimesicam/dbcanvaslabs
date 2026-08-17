@@ -187,6 +187,60 @@ const PROVISION_STEPS = {
   'cnpg-initdb': 22,
   // Same recipe shape as cnpg-json-logs (operator + cluster + plugin + client).
   'cnpg-taints-tolerations': 26,
+  // Same recipe shape as cnpg-metrics (operator + cluster + client). captureBaseline, which
+  // the drift lab adds, logs nothing.
+  'cnpg-node-selector': 24,
+  'cnpg-podspec-drift': 24,
+  'cnpg-multi-arch': 24,
+  'cnpg-inherited-metadata': 24,
+  'cnpg-object-metadata': 24,
+  // Same recipe shape as cnpg-operator-upgrade — it starts on the previous release too.
+  'cnpg-in-place-upgrade': 27,
+  // Operator + cluster + plugin + client, plus one line for seeding the table. Measured: 27.
+  'cnpg-data-corruption': 27,
+  // Operator + cluster + client, plus seeding and one staged manifest. Measured: 26.
+  'cnpg-basebackup-clone': 26,
+  // Operator + cluster + client, plus two seeding lines and one staged manifest. Measured: 27.
+  'cnpg-import-microservice': 27,
+  'cnpg-import-monolith': 27,
+  // The volume-snapshot recipe (CSI stack first) plus a seeded table. Measured: 41.
+  'cnpg-storage-expansion': 41,
+  // Operator + cluster + client, plus one line for seeding. Measured: 25.
+  'cnpg-wal-volume': 25,
+  'cnpg-declarative-hibernation': 25,
+  // Operator + cluster + client. captureBaseline and the pinned single-instance apply log
+  // the same number of lines as the ordinary one. Measured: 24.
+  'cnpg-node-drain': 24,
+  'cnpg-single-instance-drain': 24,
+  // The storage-expansion shape plus one staged-manifest line. Measured: 42.
+  'cnpg-snapshot-modes': 42,
+  // Both storage stacks — the CSI driver and the Barman Cloud plugin — plus seeding, WAL
+  // archiving and four staged manifests. The longest recipe here. Measured: 57.
+  'cnpg-snapshot-pitr': 57,
+  // The snapshot recipe plus the cnpg plugin and a seeded table. Measured: 43.
+  'cnpg-plugin-snapshot-backup': 43,
+  // The snapshot recipe plus seeding and two staged schedules. Measured: 42.
+  'cnpg-scheduled-snapshots': 42,
+  // Operator + cluster + client, nothing staged. Measured: 24.
+  'cnpg-managed-roles': 24,
+  // The managed-roles recipe plus the Secret, the role declaration and the wait for the role
+  // to exist in the database. Measured: 27.
+  'cnpg-role-passwords': 27,
+  // Operator, cluster and client — the tablespaces are the lab's own work. Measured: 24.
+  'cnpg-tablespaces': 24,
+  'cnpg-temporary-tablespaces': 24,
+  // The same, plus the staged Database manifests. Measured: 25.
+  'cnpg-declarative-databases': 25,
+  'cnpg-database-reclaim': 25,
+  // Both the plugin backup stack and a tablespace, plus seeding and two staged manifests.
+  // Measured: 43.
+  'cnpg-tablespace-backup': 43,
+  // The snapshot stack, a single-instance cluster with a tablespace, seeding and three staged
+  // manifests. Measured: 42.
+  'cnpg-tablespace-snapshot': 42,
+  // Both PostgreSQL majors pre-seeded, a 3-instance cluster on the older one, and seeding.
+  // Measured: 27.
+  'cnpg-major-upgrade': 27,
 }
 const DEFAULT_PROVISION_STEPS = 19
 

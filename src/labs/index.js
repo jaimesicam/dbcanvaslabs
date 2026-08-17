@@ -42,6 +42,34 @@ import { cnpgTaintsTolerations } from './cnpg-taints-tolerations.js'
 import { cnpgOperatorDeployment } from './cnpg-operator-deployment.js'
 import { cnpgOperatorConfigMap } from './cnpg-operator-configmap.js'
 import { cnpgOperatorPodDeletion } from './cnpg-operator-pod-deletion.js'
+import { cnpgNodeSelector } from './cnpg-node-selector.js'
+import { cnpgPodSpecDrift } from './cnpg-podspec-drift.js'
+import { cnpgInPlaceUpgrade } from './cnpg-in-place-upgrade.js'
+import { cnpgMultiArch } from './cnpg-multi-arch.js'
+import { cnpgInheritedMetadata } from './cnpg-inherited-metadata.js'
+import { cnpgObjectMetadata } from './cnpg-object-metadata.js'
+import { cnpgDataCorruption } from './cnpg-data-corruption.js'
+import { cnpgBasebackupClone } from './cnpg-basebackup-clone.js'
+import { cnpgImportMicroservice } from './cnpg-import-microservice.js'
+import { cnpgImportMonolith } from './cnpg-import-monolith.js'
+import { cnpgStorageExpansion } from './cnpg-storage-expansion.js'
+import { cnpgWALVolume } from './cnpg-wal-volume.js'
+import { cnpgNodeDrain } from './cnpg-node-drain.js'
+import { cnpgSingleInstanceDrain } from './cnpg-single-instance-drain.js'
+import { cnpgDeclarativeHibernation } from './cnpg-declarative-hibernation.js'
+import { cnpgSnapshotModes } from './cnpg-snapshot-modes.js'
+import { cnpgSnapshotPITR } from './cnpg-snapshot-pitr.js'
+import { cnpgPluginSnapshotBackup } from './cnpg-plugin-snapshot-backup.js'
+import { cnpgScheduledSnapshots } from './cnpg-scheduled-snapshots.js'
+import { cnpgManagedRoles } from './cnpg-managed-roles.js'
+import { cnpgRolePasswords } from './cnpg-role-passwords.js'
+import { cnpgTablespaces } from './cnpg-tablespaces.js'
+import { cnpgTemporaryTablespaces } from './cnpg-temporary-tablespaces.js'
+import { cnpgDeclarativeDatabases } from './cnpg-declarative-databases.js'
+import { cnpgDatabaseReclaim } from './cnpg-database-reclaim.js'
+import { cnpgTablespaceBackup } from './cnpg-tablespace-backup.js'
+import { cnpgTablespaceSnapshot } from './cnpg-tablespace-snapshot.js'
+import { cnpgMajorUpgrade } from './cnpg-major-upgrade.js'
 
 /** Every lab this app has is playable end to end — there is no browse-only content. */
 export const PLAYABLE = {
@@ -88,6 +116,34 @@ export const PLAYABLE = {
   [cnpgOperatorDeployment.id]: cnpgOperatorDeployment,
   [cnpgOperatorConfigMap.id]: cnpgOperatorConfigMap,
   [cnpgOperatorPodDeletion.id]: cnpgOperatorPodDeletion,
+  [cnpgNodeSelector.id]: cnpgNodeSelector,
+  [cnpgPodSpecDrift.id]: cnpgPodSpecDrift,
+  [cnpgInPlaceUpgrade.id]: cnpgInPlaceUpgrade,
+  [cnpgMultiArch.id]: cnpgMultiArch,
+  [cnpgInheritedMetadata.id]: cnpgInheritedMetadata,
+  [cnpgObjectMetadata.id]: cnpgObjectMetadata,
+  [cnpgDataCorruption.id]: cnpgDataCorruption,
+  [cnpgBasebackupClone.id]: cnpgBasebackupClone,
+  [cnpgImportMicroservice.id]: cnpgImportMicroservice,
+  [cnpgImportMonolith.id]: cnpgImportMonolith,
+  [cnpgStorageExpansion.id]: cnpgStorageExpansion,
+  [cnpgWALVolume.id]: cnpgWALVolume,
+  [cnpgNodeDrain.id]: cnpgNodeDrain,
+  [cnpgSingleInstanceDrain.id]: cnpgSingleInstanceDrain,
+  [cnpgDeclarativeHibernation.id]: cnpgDeclarativeHibernation,
+  [cnpgSnapshotModes.id]: cnpgSnapshotModes,
+  [cnpgSnapshotPITR.id]: cnpgSnapshotPITR,
+  [cnpgPluginSnapshotBackup.id]: cnpgPluginSnapshotBackup,
+  [cnpgScheduledSnapshots.id]: cnpgScheduledSnapshots,
+  [cnpgManagedRoles.id]: cnpgManagedRoles,
+  [cnpgRolePasswords.id]: cnpgRolePasswords,
+  [cnpgTablespaces.id]: cnpgTablespaces,
+  [cnpgTemporaryTablespaces.id]: cnpgTemporaryTablespaces,
+  [cnpgDeclarativeDatabases.id]: cnpgDeclarativeDatabases,
+  [cnpgDatabaseReclaim.id]: cnpgDatabaseReclaim,
+  [cnpgTablespaceBackup.id]: cnpgTablespaceBackup,
+  [cnpgTablespaceSnapshot.id]: cnpgTablespaceSnapshot,
+  [cnpgMajorUpgrade.id]: cnpgMajorUpgrade,
 }
 
 const TTL_LABEL = { '2h': '2 hours', '3h': '3 hours', '4h': '4 hours', '8h': '8 hours', '24h': '24 hours' }

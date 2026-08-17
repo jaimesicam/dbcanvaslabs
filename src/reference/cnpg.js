@@ -103,6 +103,75 @@ pg-cluster   4m15s   3           3       Cluster in healthy state   pg-cluster-2
             'STATUS is a real state machine, not decoration: "Setting up primary", "Creating a new replica", "Waiting for the instances to become active", "Switchover in progress", "Failing over", "Cluster in healthy state".',
           ],
         },
+        {
+          id: 'object-metadata',
+          name: 'kubectl get all,pvc,secret -l cnpg.io/cluster=<name>',
+          summary:
+            'Every object the operator generates for a Cluster carries the same label naming it, so one selector inventories the lot. The per-kind role labels beside it are what the Services select on — they are the routing, not documentation.',
+          usedIn: ['cnpg-object-metadata'],
+          examples: [
+            {
+              run: `kubectl get pod pg-cluster-1 -o json | jq -S '.metadata.labels'`,
+              out: `{
+  "app.kubernetes.io/component": "database",
+  "app.kubernetes.io/instance": "pg-cluster",
+  "app.kubernetes.io/managed-by": "cloudnative-pg",
+  "app.kubernetes.io/name": "postgresql",
+  "app.kubernetes.io/version": "18",
+  "cnpg.io/cluster": "pg-cluster",
+  "cnpg.io/instanceName": "pg-cluster-1",
+  "cnpg.io/instanceRole": "primary",
+  "cnpg.io/podRole": "instance",
+  "role": "primary"
+}`,
+              note: 'Two families: the Kubernetes-wide recommended app.kubernetes.io/ labels, and the operator\'s own cnpg.io/ ones. `role` is the older unprefixed form of `cnpg.io/instanceRole`, still written for compatibility.',
+            },
+            {
+              run: `kubectl get pods -l cnpg.io/cluster=pg-cluster -L cnpg.io/podRole,cnpg.io/instanceRole
+kubectl get pvc -l cnpg.io/cluster=pg-cluster -L cnpg.io/pvcRole,cnpg.io/instanceRole
+kubectl get secret pg-cluster-app -o json | jq -S -c '.metadata.labels'`,
+              out: `NAME           READY   STATUS    RESTARTS   AGE    PODROLE    INSTANCEROLE
+pg-cluster-1   1/1     Running   0          113s   instance   primary
+pg-cluster-2   1/1     Running   0          75s    instance   replica
+pg-cluster-3   1/1     Running   0          34s    instance   replica
+NAME           STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   PVCROLE   INSTANCEROLE
+pg-cluster-1   Bound    pvc-51f0f8b0-5536-40cf-8926-6a0dbb881eb0   1Gi        RWO            local-path     PG_DATA   primary
+pg-cluster-2   Bound    pvc-fd738746-e698-4b98-8d44-e5006b606e3d   1Gi        RWO            local-path     PG_DATA   replica
+pg-cluster-3   Bound    pvc-6d5057c8-57d4-436e-9ee3-360dacce52dd   1Gi        RWO            local-path     PG_DATA   replica
+{"app.kubernetes.io/managed-by":"cloudnative-pg","cnpg.io/cluster":"pg-cluster","cnpg.io/reload":"true","cnpg.io/userType":"app"}`,
+              note: 'The claims listing has its VOLUMEATTRIBUTESCLASS and AGE columns elided for width. `cnpg.io/reload=true` on the Secret is a request rather than a description — it asks the operator to reload the instances when the Secret changes.',
+            },
+            {
+              run: `kubectl get pods -l cnpg.io/cluster=pg-cluster -o json \\
+  | jq -r '.items[] | [.metadata.name, .metadata.annotations["cnpg.io/nodeSerial"], .metadata.annotations["cnpg.io/operatorVersion"]] | @tsv'
+kubectl get pvc pg-cluster-1 -o json | jq -c '.metadata.annotations | {nodeSerial: ."cnpg.io/nodeSerial", pvcStatus: ."cnpg.io/pvcStatus"}'`,
+              out: `pg-cluster-1	1	1.30.0
+pg-cluster-2	2	1.30.0
+pg-cluster-3	3	1.30.0
+{"nodeSerial":"1","pvcStatus":"ready"}`,
+              note: 'nodeSerial appears on both the Pod and its claim, which is how a rebuilt Pod finds the volume that belongs to it.',
+            },
+            {
+              run: `kubectl label pod pg-cluster-2 cnpg.io/instanceRole=primary --overwrite
+for i in $(seq 1 16); do printf "%s %s\\n" "$(date +%H:%M:%S.%2N)" "$(kubectl get pod pg-cluster-2 -o jsonpath='{.metadata.labels.cnpg\\.io/instanceRole}')"; sleep 0.25; done`,
+              out: `pod/pg-cluster-2 labeled
+17:50:43.43 primary
+17:50:43.71 primary
+17:50:43.98 primary
+17:50:44.25 primary
+17:50:44.52 replica
+17:50:44.79 replica
+17:50:45.06 replica
+17:50:45.33 replica`,
+              note: 'Output truncated after the change is reverted. The operator recomputes the role from the cluster\'s real state on every event, so the hand-written value survives about a second and the read-write Service never gains a second endpoint. A label of your own on the same Pod is left alone indefinitely.',
+            },
+          ],
+          notes: [
+            '`kubectl get all` does not include PersistentVolumeClaims or Secrets — ask for them by name in the same command.',
+            'The Services are pure selectors: -rw on `cnpg.io/instanceRole=primary`, -ro on `=replica`, -r on `cnpg.io/podRole=instance`. A failover, from the Service\'s point of view, is a relabelling.',
+            'Promotion is not something a label can do; the label is a consequence of the promotion. Use the operator\'s own mechanisms and keep your metadata under your own keys.',
+          ],
+        },
       ],
     },
 
@@ -259,6 +328,87 @@ pg-cluster-3   Bound    pvc-0ef694f3-dceb-4697-bcf6-c5ca3e4881ba   1Gi        RW
           ],
         },
         {
+          id: 'storage-expansion',
+          name: 'spec.storage.size (volume expansion)',
+          summary:
+            'Grows a running instance\'s volume in place — if the StorageClass allows it. Expansion is one-way, and the two numbers that tell you whether it has finished live in different places on the claim.',
+          usedIn: ['cnpg-storage-expansion'],
+          examples: [
+            {
+              run: `kubectl get storageclass -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,EXPANSION:.allowVolumeExpansion,BINDING:.volumeBindingMode
+kubectl get pvc pg-cluster-1 -o custom-columns=NAME:.metadata.name,REQUESTED:.spec.resources.requests.storage,ACTUAL:.status.capacity.storage,VOLUME:.spec.volumeName`,
+              out: `NAME              PROVISIONER             EXPANSION   BINDING
+csi-hostpath-sc   hostpath.csi.k8s.io     true        WaitForFirstConsumer
+local-path        rancher.io/local-path   <none>      WaitForFirstConsumer
+NAME           REQUESTED   ACTUAL   VOLUME
+pg-cluster-1   1Gi         1Gi      pvc-a97e1785-b950-4d2b-8922-43edee78f32a`,
+              note: 'An absent allowVolumeExpansion means false. k3s\'s own local-path cannot grow a volume; the CSI driver\'s class can.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"storage":{"size":"2Gi"}}}'
+kubectl get pvc pg-cluster-1 -o custom-columns=REQUESTED:.spec.resources.requests.storage,ACTUAL:.status.capacity.storage
+kubectl describe pvc pg-cluster-1 | tail -4`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+REQUESTED   ACTUAL
+2Gi         1Gi
+  Normal  ExternalExpanding           40s   volume_expand                         waiting for an external controller to expand this PVC
+  Normal  Resizing                    40s   external-resizer hostpath.csi.k8s.io  External resizer is resizing volume pvc-a97e1785-b950-4d2b-8922-43edee78f32a
+  Normal  FileSystemResizeRequired    40s   external-resizer hostpath.csi.k8s.io  Require file system resize of volume on node
+  Normal  FileSystemResizeSuccessful  66s   kubelet                               MountVolume.NodeExpandVolume succeeded for volume "pvc-a97e1785-b950-4d2b-8922-43edee78f32a"`,
+              note: 'The request moves at once and the capacity follows a minute or so later — the gap is the resize in flight. The event columns are elided for width; the four events are the four handoffs, and a stuck resize is stuck at one of them.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"storage":{"size":"1Gi"}}}'
+kubectl patch pvc scratch --type=merge -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'`,
+              out: `The Cluster "pg-cluster" is invalid: spec.storage: Invalid value: "1Gi": can't shrink existing storage from 2Gi to 1Gi
+Error from server (Forbidden): persistentvolumeclaims "scratch" is forbidden: only dynamically provisioned pvc can be resized and the storageclass that provisions the pvc must support resize`,
+              note: 'Two different refusals: the first from the operator\'s validating webhook, the second from the API server on a bound claim whose StorageClass does not allow expansion. Neither leaves anything half done.',
+            },
+          ],
+          notes: [
+            'The claim keeps its name across a rebuild, so the only way to tell an expansion from a replacement is `spec.volumeName` — the volume behind it.',
+            'Nothing restarts: the Pod keeps its creation timestamp and PostgreSQL serves throughout.',
+            '`resizeInUseVolumes` (default true) is CloudNativePG\'s willingness to grow claims that are currently mounted, which is the interesting case.',
+          ],
+        },
+        {
+          id: 'wal-storage',
+          name: 'spec.walStorage',
+          summary:
+            'Gives the write-ahead log a volume of its own. Can be added to a running cluster, rearranges the data directory with a symbolic link, and cannot be removed afterwards.',
+          usedIn: ['cnpg-wal-volume'],
+          examples: [
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"walStorage":{"size":"1Gi"}}}'
+kubectl get pvc
+kubectl exec $PRIMARY -c postgres -- ls -ld /var/lib/postgresql/data/pgdata/pg_wal`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+NAME               STATUS   VOLUME                                     CAPACITY   STORAGECLASS   AGE
+pg-cluster-1       Bound    pvc-6213e3fe-3c3b-49dc-abb1-d8cd23945aa6   1Gi        local-path     3m36s
+pg-cluster-1-wal   Bound    pvc-3e04a2ca-042a-431e-9e68-b5c954a58f28   1Gi        local-path     59s
+pg-cluster-2       Bound    pvc-d8626690-81e5-4ea3-83ce-6b62ac9c68a8   1Gi        local-path     2m44s
+pg-cluster-2-wal   Bound    pvc-2b6ed6be-a0f4-461a-b51c-2355065056af   1Gi        local-path     59s
+pg-cluster-3       Bound    pvc-4dfb0fe6-ac11-40df-9bb9-dfdc36ada660   1Gi        local-path     2m5s
+pg-cluster-3-wal   Bound    pvc-54a0c331-58ae-43ad-9c81-f680dd25c1a0   1Gi        local-path     59s
+lrwxrwxrwx 1 postgres tape 30 Aug 16 23:50 /var/lib/postgresql/data/pgdata/pg_wal -> /var/lib/postgresql/wal/pg_wal`,
+              note: 'One -wal claim per instance, and the cluster rolls to mount them — replicas first, primary last, about 45 seconds for three. Claim columns elided for width. pg_wal is now a symlink out of the data volume.',
+            },
+            {
+              run: `kubectl get pod $PRIMARY -o jsonpath='{range .spec.volumes[?(@.persistentVolumeClaim)]}{.name}{" -> "}{.persistentVolumeClaim.claimName}{"\\n"}{end}'
+kubectl patch cluster pg-cluster --type=json -p '[{"op":"remove","path":"/spec/walStorage"}]'`,
+              out: `pgdata -> pg-cluster-1
+pg-wal -> pg-cluster-1-wal
+The Cluster "pg-cluster" is invalid: spec.walStorage: Invalid value: null: walStorage cannot be disabled once configured`,
+              note: 'Two claims mounted at two paths — and the field is a one-way door. The merge-patch form with `null` is refused by the same webhook with the same message.',
+            },
+          ],
+          notes: [
+            'The WAL claims are created on the *default* StorageClass unless `walStorage.storageClass` names one, which is a good way to accidentally put the log on slower storage than the data.',
+            'Size it for `max_wal_size` plus whatever `wal_keep_size` and any replication slots retain — a WAL volume too small for that is a database that stops accepting writes.',
+            'The size can still be grown later, exactly like the data volume, if the class allows expansion. The existence of the volume cannot be undone.',
+          ],
+        },
+        {
           id: 'delete-pvc',
           name: 'kubectl delete pvc <instance>',
           summary:
@@ -350,6 +500,211 @@ Annotations:   cnpg.io/nodeSerial: 1
                pv.kubernetes.io/bound-by-controller: yes`,
               note: 'Truncated to the first 18 lines; the selected-node annotation and the events follow below them.',
             },
+          ],
+        },
+        {
+          id: 'inherited-metadata-apply',
+          name: 'spec.inheritedMetadata',
+          summary:
+            'Propagates your labels and annotations to the Pods, claims, Services and Secrets the operator creates. Applied within seconds, with nothing recreated — and with no protection against overwriting the operator\'s own keys.',
+          usedIn: ['cnpg-inherited-metadata'],
+          examples: [
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"inheritedMetadata":{"labels":{"team":"payments","cost-centre":"cc-4471"},"annotations":{"owner":"platform-db@example.com"}}}}'
+kubectl get pods,pvc,svc,secret -l cnpg.io/cluster=pg-cluster -L team,cost-centre`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+NAME               READY   STATUS    RESTARTS   AGE    TEAM       COST-CENTRE
+pod/pg-cluster-1   1/1     Running   0          2m4s   payments   cc-4471
+pod/pg-cluster-2   1/1     Running   0          87s    payments   cc-4471
+pod/pg-cluster-3   1/1     Running   0          46s    payments   cc-4471
+
+NAME                                 STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   TEAM       COST-CENTRE
+persistentvolumeclaim/pg-cluster-1   Bound    pvc-a6362505-6a72-489d-b209-a5a0c00344a9   1Gi        RWO            local-path     payments   cc-4471
+
+NAME                    TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE     TEAM       COST-CENTRE
+service/pg-cluster-rw   ClusterIP   10.43.162.161   <none>        5432/TCP   2m48s   payments   cc-4471
+
+NAME                    TYPE                       DATA   AGE     TEAM       COST-CENTRE
+secret/pg-cluster-app   kubernetes.io/basic-auth   11     2m48s   payments   cc-4471`,
+              note: 'Claims and Services elided to one row each for width. The Pod ages are unchanged from before the patch — this is a metadata update on live objects, not a rolling update.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"inheritedMetadata":{"labels":{"team":"platform"}}}}'
+kubectl get cluster pg-cluster -o jsonpath='{.spec.inheritedMetadata}'; echo
+kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"inheritedMetadata":{"labels":{"cost-centre":null}}}}'
+kubectl get cluster pg-cluster -o jsonpath='{.spec.inheritedMetadata}'; echo
+kubectl get pods -l cnpg.io/cluster=pg-cluster -L team,cost-centre`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched (no change)
+{"annotations":{"owner":"platform-db@example.com"},"labels":{"cost-centre":"cc-4471","team":"platform"}}
+cluster.postgresql.cnpg.io/pg-cluster patched
+{"annotations":{"owner":"platform-db@example.com"},"labels":{"team":"platform"}}
+NAME           READY   STATUS    RESTARTS   AGE     TEAM       COST-CENTRE
+pg-cluster-1   1/1     Running   0          2m51s   platform   cc-4471
+pg-cluster-2   1/1     Running   0          2m14s   platform   cc-4471
+pg-cluster-3   1/1     Running   0          93s     platform   cc-4471`,
+              note: 'Two separate lessons in one capture. A merge patch that omits a key does not remove it — "patched (no change)" — and removing it with an explicit null takes it out of the spec but leaves it on every object that already has it, permanently.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"inheritedMetadata":{"labels":{"cnpg.io/instanceRole":"primary"}}}}'
+kubectl get pods -l cnpg.io/cluster=pg-cluster -L cnpg.io/instanceRole
+kubectl get endpointslices -l kubernetes.io/service-name=pg-cluster-rw -o jsonpath='{.items[*].endpoints[*].addresses[*]}'; echo
+kubectl exec psql-client -- psql -h pg-cluster-rw -tAc "INSERT INTO meta_demo (note) VALUES ('during') RETURNING id;"`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+NAME           READY   STATUS    RESTARTS   AGE     INSTANCEROLE
+pg-cluster-1   1/1     Running   0          3m38s   primary
+pg-cluster-2   1/1     Running   0          3m1s    primary
+pg-cluster-3   1/1     Running   0          2m20s   primary
+10.42.2.4 10.42.1.7 10.42.0.7
+ERROR:  cannot execute INSERT in a read-only transaction`,
+              note: 'Inherited metadata is applied after the operator\'s own, so it wins. All three Pods now claim to be the primary, the read-write Service has three endpoints, and five of six writes through it landed on a replica. Removing the override restored the true roles within 20 seconds.',
+            },
+          ],
+          notes: [
+            'Labels are selectable across kinds (`kubectl get pods,pvc,svc,secret -l team=payments`); annotations are not, and are for information such as an owner or a ticket.',
+            'Inherit keys in a namespace you own. `cnpg.io/` belongs to the operator on these objects, and so does `app.kubernetes.io/`.',
+            'The operator re-asserts the keys its own routing depends on the moment an override is removed, and leaves everything else exactly where it is — which is why a stale cost-centre label outlives the spec that asked for it while a stale instanceRole does not.',
+            'There is an operator-wide equivalent, `INHERITED_LABELS` and `INHERITED_ANNOTATIONS` in the operator ConfigMap, which applies to every cluster and is read only at operator startup. This field is per-cluster and takes effect immediately.',
+          ],
+        },
+        {
+          id: 'declare-tablespaces',
+          name: 'spec.tablespaces (declarative tablespaces)',
+          summary:
+            'A tablespace is a directory PostgreSQL may put relations in; here it is a declaration that becomes one claim per instance, mounted and registered with the server.',
+          usedIn: ['cnpg-tablespaces', 'cnpg-temporary-tablespaces'],
+          examples: [
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{
+  "spec": {"tablespaces": [
+    {"name": "reporting", "storage": {"size": "1Gi"}, "owner": {"name": "app"}},
+    {"name": "archive",   "storage": {"size": "1Gi"}}
+  ]}}'
+for i in $(seq 1 12); do
+  printf "%s " "$(date +%T)"
+  kubectl get cluster pg-cluster -o jsonpath='{.status.phase}|{range .status.tablespacesStatus[*]}{.name}={.state} {end}'
+  echo
+  sleep 10
+done`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+04:35:34 Waiting for the instances to become active|reporting=pending archive=pending
+04:35:44 Upgrading cluster|reporting=pending archive=pending
+04:36:04 Primary instance is being restarted without a switchover|reporting=pending archive=pending
+04:36:15 Cluster in healthy state|reconciled archive=reconciled`,
+              note: 'Attaching volumes replaces the Pods, so declaring a tablespace rolls the cluster — about 50 seconds for three instances. Rows elided from the middle of the loop.',
+            },
+            {
+              run: `kubectl get pvc
+kubectl get pvc pg-cluster-1-tbs-reporting -o jsonpath='{.metadata.labels}{"\\n"}'`,
+              out: `pg-cluster-1                 Bound   1Gi   RWO   local-path   6m28s
+pg-cluster-1-tbs-archive     Bound   1Gi   RWO   local-path   3m32s
+pg-cluster-1-tbs-reporting   Bound   1Gi   RWO   local-path   3m32s
+pg-cluster-2-tbs-archive     Bound   1Gi   RWO   local-path   3m32s
+pg-cluster-2-tbs-reporting   Bound   1Gi   RWO   local-path   3m32s
+{"cnpg.io/cluster":"pg-cluster","cnpg.io/instanceName":"pg-cluster-1","cnpg.io/pvcRole":"PG_TABLESPACE","cnpg.io/tablespaceName":"reporting","cnpg.io/instanceRole":"primary"}`,
+              note: 'One claim per instance per tablespace — three instances and two tablespaces is six volumes. Columns and the third instance elided; some labels elided from the second output.',
+            },
+            {
+              run: `kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "SELECT spcname, pg_get_userbyid(spcowner) AS owner, pg_tablespace_location(oid) FROM pg_tablespace ORDER BY spcname;"
+kubectl exec pg-cluster-1 -c postgres -- ls -l /var/lib/postgresql/data/pgdata/pg_tblspc/`,
+              out: `  spcname   |  owner   |             pg_tablespace_location
+------------+----------+------------------------------------------------
+ archive    | app      | /var/lib/postgresql/tablespaces/archive/data
+ pg_default | postgres |
+ pg_global  | postgres |
+ reporting  | app      | /var/lib/postgresql/tablespaces/reporting/data
+(4 rows)
+
+lrwxrwxrwx 1 postgres tape 46 Aug 17 04:36 16393 -> /var/lib/postgresql/tablespaces/reporting/data
+lrwxrwxrwx 1 postgres tape 44 Aug 17 04:36 16394 -> /var/lib/postgresql/tablespaces/archive/data`,
+              note: 'The symlink in pg_tblspc, named after the tablespace OID, is the whole implementation. Note that archive is owned by app although no owner was given — the webhook defaults it.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{
+  "spec": {"tablespaces": [
+    {"name": "reporting", "storage": {"size": "1Gi"}, "owner": {"name": "app"}}
+  ]}}'`,
+              out: 'The Cluster "pg-cluster" is invalid: spec.tablespaces[1]: Invalid value: […]: no tablespace can be deleted once created',
+              note: 'Sending the list without a tablespace is refused at admission. The value in the message is the list you sent; elided here.',
+            },
+            {
+              run: `kubectl get cluster pg-cluster -o jsonpath='{.spec.tablespaces}{"\\n"}'`,
+              out: '[{"name":"reporting","owner":{"name":"app"},"storage":{"resizeInUseVolumes":true,"size":"1Gi"},"temporary":false},{"name":"archive","owner":{"name":"app"},"storage":{"resizeInUseVolumes":true,"size":"1Gi"},"temporary":false}]',
+              note: 'What the cluster holds is not what you sent: owner, temporary and resizeInUseVolumes are defaulted in. A merge patch replaces the whole list, so every later change has to resend all of it.',
+            },
+          ],
+          notes: [
+            'A tablespace cannot be undeclared — `no tablespace can be deleted once created` — so adding one is a decision about every instance for as long as the cluster exists.',
+            'Using one is ordinary SQL: `CREATE TABLE … TABLESPACE reporting`, and `pg_tables.tablespace` records it. Every replica has the same table in the same tablespace, in its own physical copy.',
+            'Growing a tablespace on a StorageClass that cannot expand is accepted by the webhook and then fails in the storage layer, which wedges the reconcile loop: "error while changing PVC storage requirement", and later tablespaces stay `pending` behind it.',
+            'Name a `storageClass` per tablespace to put relations on different storage; leave it out and the tablespace lands on the default class.',
+          ],
+        },
+        {
+          id: 'temporary-tablespace',
+          name: 'spec.tablespaces[].temporary (temp_tablespaces)',
+          summary:
+            "Sends temporary objects and spilled sorts to a volume of their own instead of the one holding the database — one field, and PostgreSQL's temp_tablespaces does the rest.",
+          usedIn: ['cnpg-temporary-tablespaces'],
+          examples: [
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{
+  "spec": {"tablespaces": [
+    {"name": "scratch", "storage": {"size": "1Gi"}, "temporary": true}
+  ]}}'
+for p in pg-cluster-1 pg-cluster-2 pg-cluster-3; do
+  printf "%-14s " "$p"
+  kubectl exec $p -c postgres -- psql -U postgres -tAc "SHOW temp_tablespaces;"
+done`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+pg-cluster-1   scratch
+pg-cluster-2   scratch
+pg-cluster-3   scratch`,
+              note: 'Every instance gets the setting, not just the primary — standbys spill too, and cannot borrow the disk the primary uses.',
+            },
+            {
+              run: `kubectl exec psql-client -- psql -h pg-cluster-rw -c "CREATE TEMP TABLE scratch_demo AS SELECT g, repeat('x',200) AS pad FROM generate_series(1,200000) g;
+   SELECT c.relname, t.spcname FROM pg_class c LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace WHERE c.relname = 'scratch_demo';"`,
+              out: `SELECT 200000
+   relname    | spcname
+--------------+---------
+ scratch_demo | scratch
+(1 row)`,
+              note: 'Both statements must be in one psql invocation: a temporary table does not outlive its session.',
+            },
+            {
+              run: `kubectl exec psql-client -- psql -h pg-cluster-rw -c "SET work_mem='64kB';
+   CREATE TEMP TABLE spill AS SELECT g, repeat('y',300) AS pad FROM generate_series(1,300000) g ORDER BY md5(g::text);
+   SELECT pg_sleep(25);" &
+sleep 12
+kubectl exec pg-cluster-1 -c postgres -- du -sh /var/lib/postgresql/tablespaces/scratch
+kubectl exec pg-cluster-1 -c postgres -- sh -c 'du -sh /var/lib/postgresql/data/pgdata/base/pgsql_tmp; ls -1 /var/lib/postgresql/data/pgdata/base/pgsql_tmp | wc -l'
+wait
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "SELECT temp_files, pg_size_pretty(temp_bytes) FROM pg_stat_database WHERE datname = 'app';"`,
+              out: `99M	/var/lib/postgresql/tablespaces/scratch
+4.0K	/var/lib/postgresql/data/pgdata/base/pgsql_tmp
+0
+ temp_files | pg_size_pretty
+------------+----------------
+          3 | 107 MB
+(1 row)`,
+              note: 'Mid-query: 99M in the tablespace, and base/pgsql_tmp present but empty. PostgreSQL creates that directory at startup either way, so emptiness is the evidence, not absence.',
+            },
+            {
+              run: `kubectl exec psql-client -- psql -h pg-cluster-ro -c "SET work_mem='64kB'; SELECT count(*) FROM (SELECT g, md5(g::text) FROM generate_series(1,400000) g ORDER BY md5(g::text)) s;"
+for p in pg-cluster-1 pg-cluster-2 pg-cluster-3; do
+  printf "%-14s " "$p"
+  kubectl exec $p -c postgres -- psql -U postgres -tAc "SELECT 'in_recovery=' || pg_is_in_recovery() || ' temp_files=' || temp_files || ' temp_bytes=' || pg_size_pretty(temp_bytes) FROM pg_stat_database WHERE datname = 'app';"
+done`,
+              out: `pg-cluster-1   in_recovery=false temp_files=5 temp_bytes=212 MB
+pg-cluster-2   in_recovery=true temp_files=0 temp_bytes=0 bytes
+pg-cluster-3   in_recovery=true temp_files=2 temp_bytes=22 MB`,
+              note: 'The -ro Service sent the sort to one standby, and only that instance wrote temporary files. pg_stat_database is per-instance and is not replicated.',
+            },
+          ],
+          notes: [
+            '`temp_files` and `temp_bytes` are cumulative per instance and reset only by a restart — they are the metric that says a workload is spilling at all.',
+            'The files are deleted when the query that owned them ends: the tablespace went back to 20K afterwards.',
+            'A temporary tablespace is provisioned on every instance, so size it for the largest query any single instance might serve — and remember it is the one volume whose contents are worth nothing.',
           ],
         },
       ],
@@ -1475,6 +1830,139 @@ pg-cluster-3   Bound   pvc-ca3058d5-…   1Gi   RWO   local-path   8m38s`,
           ],
         },
         {
+          id: 'hibernation-annotation',
+          name: 'cnpg.io/hibernation (declarative)',
+          summary:
+            'The annotation the hibernation plugin command sets, applied directly. Removes every instance Pod, keeps every volume — and leaves a cluster that goes on describing itself as healthy.',
+          usedIn: ['cnpg-declarative-hibernation'],
+          examples: [
+            {
+              run: `kubectl annotate cluster pg-cluster cnpg.io/hibernation=on
+kubectl get pods -l cnpg.io/cluster=pg-cluster
+kubectl get pvc
+kubectl get cluster pg-cluster`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster annotated
+No resources found in default namespace.
+NAME           STATUS   VOLUME                                     CAPACITY   STORAGECLASS   AGE
+pg-cluster-1   Bound    pvc-063373a9-6bc1-4fd4-b666-8917edf22e2d   1Gi        local-path     2m39s
+pg-cluster-2   Bound    pvc-ee88f990-7c7c-4784-95f4-22b191c81f36   1Gi        local-path     115s
+pg-cluster-3   Bound    pvc-4187ea1e-bb84-4c76-bf8d-a09645a4174f   1Gi        local-path     72s
+NAME         AGE     INSTANCES   READY   STATUS                     PRIMARY
+pg-cluster   2m41s   3                   Cluster in healthy state   pg-cluster-1`,
+              note: 'Pods gone in about ten seconds, claims untouched — and STATUS still reads healthy with a blank READY column. Claim columns elided for width.',
+            },
+            {
+              run: `kubectl get cluster pg-cluster \
+  -o jsonpath='{range .status.conditions[*]}{.type}{"\\t"}{.status}{"\\t"}{.reason}{"\\n"}{end}'`,
+              out: `Initialized	True	BootstrapCompleted
+ConsistentSystemID	False	NotFound
+Ready	True	ClusterIsReady
+ContinuousArchiving	True	ContinuousArchivingSuccess
+cnpg.io/hibernation	True	Hibernated`,
+              note: 'The condition is the honest signal, and it is removed rather than set to False on waking — so alerting has to treat absent as awake. ConsistentSystemID goes False because no instance is left to report one.',
+            },
+            {
+              run: `for s in pg-cluster-rw pg-cluster-ro pg-cluster-r; do
+  printf "%-14s " "$s"
+  kubectl get endpointslices -l kubernetes.io/service-name=$s -o jsonpath='{.items[*].endpoints[*].addresses[*]}'
+  echo
+done
+kubectl exec psql-client -- psql -h pg-cluster-rw -c "SELECT 1;"`,
+              out: `pg-cluster-rw  
+pg-cluster-ro  
+pg-cluster-r   
+psql: error: connection to server at "pg-cluster-rw" (10.43.31.180), port 5432 failed: Connection refused`,
+              note: 'The Services survive with no endpoints, so a client gets connection refused rather than a name that does not resolve — which fools any check that treats DNS as liveness.',
+            },
+            {
+              run: `kubectl annotate cluster pg-cluster cnpg.io/hibernation=off --overwrite
+kubectl get pods -l cnpg.io/cluster=pg-cluster -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp
+kubectl get pvc -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster annotated
+NAME           CREATED
+pg-cluster-1   2026-08-17T00:08:25Z
+pg-cluster-2   2026-08-17T00:08:36Z
+pg-cluster-3   2026-08-17T00:08:40Z
+NAME           CREATED
+pg-cluster-1   2026-08-17T00:05:24Z
+pg-cluster-2   2026-08-17T00:06:08Z
+pg-cluster-3   2026-08-17T00:06:51Z`,
+              note: 'Back in about thirty seconds, and every Pod is younger than the claim it is using — new processes on old disks, which is what proves nothing was copied.',
+            },
+          ],
+          notes: [
+            'The Cluster stays an ordinary editable object while it sleeps: a parameter changed with no instances running is simply in force when they start again.',
+            '`--overwrite` is required to change an annotation that already exists.',
+            'It is not a backup. The volumes are still the only copy, and a hibernated cluster is one whose replication and backups have stopped.',
+          ],
+        },
+        {
+          id: 'node-drain-pdb',
+          name: 'kubectl drain + PodDisruptionBudgets',
+          summary:
+            'A drain cordons a node and then asks its Pods to leave. What answers is the pair of budgets CloudNativePG maintains — one over the replicas with room for one disruption, one over the primary with room for none.',
+          usedIn: ['cnpg-node-drain', 'cnpg-single-instance-drain'],
+          examples: [
+            {
+              run: `kubectl get pdb -o custom-columns=NAME:.metadata.name,MIN:.spec.minAvailable,SELECTOR:.spec.selector.matchLabels,ALLOWED:.status.disruptionsAllowed,HEALTHY:.status.currentHealthy`,
+              out: `NAME                 MIN   SELECTOR                                                       ALLOWED   HEALTHY
+pg-cluster           1     map[cnpg.io/cluster:pg-cluster cnpg.io/instanceRole:replica]   1         2
+pg-cluster-primary   1     map[cnpg.io/cluster:pg-cluster cnpg.io/instanceRole:primary]   0         1`,
+              note: 'ALLOWED DISRUPTIONS is computed as currentHealthy − minAvailable, so the primary\'s budget can never allow one. A single-instance cluster gets only the second of these.',
+            },
+            {
+              run: `kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --force
+kubectl get events --field-selector reason=FailedScheduling,involvedObject.name=pg-cluster-2`,
+              out: `node/k3d-dbol-186682b7bc52-agent-0 cordoned
+Warning: deleting Pods that declare no controller: default/psql-client; ignoring DaemonSet-managed Pods: metallb-system/speaker-nrnjs
+evicting pod default/pg-cluster-2
+evicting pod default/psql-client
+pod/pg-cluster-2 evicted
+pod/psql-client evicted
+node/k3d-dbol-186682b7bc52-agent-0 drained
+LAST SEEN   TYPE      REASON             OBJECT             MESSAGE
+50s         Warning   FailedScheduling   pod/pg-cluster-2   0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match PersistentVolume's node affinity.`,
+              note: 'The replica is evicted and then stranded: its local-path volume is on the node that was just cordoned. Note the warning about Pods with no controller — a bare Pod is deleted and never comes back.',
+            },
+            {
+              run: `# a single-instance cluster: the eviction is refused for the whole timeout
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --force --timeout=60s`,
+              out: `node/k3d-dbol-1c4b277ef95c-agent-0 cordoned
+evicting pod default/pg-cluster-1
+error when evicting pods/"pg-cluster-1" -n "default" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod default/pg-cluster-1
+error when evicting pods/"pg-cluster-1" -n "default" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.`,
+              note: 'Without --timeout this retries forever. The node stays cordoned after a failed drain, and the database keeps serving throughout — which is the budget doing its job.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"enablePDB":false}}'
+kubectl get pdb
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --force --timeout=60s
+kubectl get pods -l cnpg.io/cluster=pg-cluster
+kubectl exec psql-client -- psql -h pg-cluster-rw -c "SELECT 1;"`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+No resources found in default namespace.
+pod/pg-cluster-1 evicted
+node/k3d-dbol-1c4b277ef95c-agent-0 drained
+NAME           READY   STATUS    RESTARTS   AGE   IP       NODE
+pg-cluster-1   0/1     Pending   0          10s   <none>   <none>
+psql: error: connection to server at "pg-cluster-rw" (10.43.47.120), port 5432 failed: Connection refused`,
+              note: 'Turning the budget off does not make the drain safe, it makes it quiet: the instance has nowhere to go and the database is down until the node is uncordoned.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"nodeMaintenanceWindow":{"inProgress":true,"reusePVC":false}}}'`,
+              out: `Warning: Consider using \`.spec.enablePDB\` instead of the node maintenance window feature
+cluster.postgresql.cnpg.io/pg-cluster patched`,
+              note: 'reusePVC:false tells the operator to stop waiting for the drained node: the stranded claim is deleted and the instance is rebuilt elsewhere with pg_basebackup, about a minute for a small database. The API server points at the newer lever as it accepts the patch.',
+            },
+          ],
+          notes: [
+            'A drain cordons first and evicts second, and the cordon is not undone when the eviction fails — a failed drain still leaves the node unschedulable.',
+            'Draining the primary\'s node is refused once by the primary budget; the operator responds by moving the primary, after which the same eviction succeeds.',
+            'All of this is sharp only because the storage is node-local. With volumes that follow the Pod, an evicted instance simply starts somewhere else.',
+          ],
+        },
+        {
           id: 'postgres-parameters',
           name: 'spec.postgresql.parameters',
           summary:
@@ -1521,6 +2009,136 @@ The Cluster "pg-cluster" is invalid: spec.postgresql.parameters.wal_log_hints: I
           notes: [
             'The operator writes its values to `custom.conf` in the data directory, included from `postgresql.conf` — that is the file to read when the spec and the running value seem to disagree.',
             'A rejected update is rejected whole and changes nothing, which is the practical advantage of a check at admission rather than at reconciliation.',
+          ],
+        },
+        {
+          id: 'initdb-import',
+          name: 'spec.bootstrap.initdb.import',
+          summary:
+            'Bootstraps a cluster out of an existing PostgreSQL server with pg_dump and pg_restore. The `type` decides whether you get one application database or a whole server: microservice renames and reassigns, monolith keeps everything as it was.',
+          usedIn: ['cnpg-import-microservice', 'cnpg-import-monolith'],
+          examples: [
+            {
+              run: `# type: microservice — one database, restored into the new cluster's own app database
+kubectl apply -f /root/import.yaml
+kubectl get cluster
+kubectl exec pg-orders-1 -c postgres -- psql -U postgres -c "\\\\l"
+kubectl exec pg-orders-1 -c postgres -- psql -U postgres -d app -c "\\\\dt"`,
+              out: `cluster.postgresql.cnpg.io/pg-orders created
+NAME         AGE    INSTANCES   READY   STATUS                     PRIMARY
+pg-cluster   3m3s   3           3       Cluster in healthy state   pg-cluster-1
+pg-orders    30s    1           1       Cluster in healthy state   pg-orders-1
+   Name    |  Owner   | Encoding | Locale Provider | Collate | Ctype
+-----------+----------+----------+-----------------+---------+-------
+ app       | app      | UTF8     | libc            | C       | C
+ postgres  | postgres | UTF8     | libc            | C       | C
+ template0 | postgres | UTF8     | libc            | C       | C
+ template1 | postgres | UTF8     | libc            | C       | C
+         List of tables
+ Schema | Name  | Type  | Owner
+--------+-------+-------+-------
+ public | lines | table | app`,
+              note: 'The source database was called orders and its table was owned by shop. A microservice import restores it into the new cluster\'s application database and reassigns ownership to the app user — the database listing has its trailing columns elided for width.',
+            },
+            {
+              run: `# type: monolith with "*" — every database and every role, names and owners kept
+kubectl exec pg-estate-1 -c postgres -- psql -U postgres -c "\\\\l"
+kubectl exec pg-estate-1 -c postgres -- psql -U postgres -c \\
+  "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname NOT LIKE 'pg\\\\_%' ORDER BY rolname;"
+kubectl exec psql-client -- env PGPASSWORD=shop_pw psql -h pg-estate-rw -U shop -d orders -tAc "SELECT count(*) FROM lines;"
+kubectl get secret`,
+              out: `   Name    |  Owner   | Encoding | Locale Provider | Collate | Ctype
+-----------+----------+----------+-----------------+---------+-------
+ app       | app      | UTF8     | libc            | C       | C
+ billing   | shop     | UTF8     | libc            | C       | C
+ orders    | shop     | UTF8     | libc            | C       | C
+ postgres  | postgres | UTF8     | libc            | C       | C
+        rolname        | rolcanlogin | rolsuper
+-----------------------+-------------+----------
+ app                   | t           | f
+ cnpg_metrics_exporter | t           | f
+ postgres              | t           | t
+ reporting             | f           | f
+ shop                  | t           | f
+ streaming_replica     | t           | f
+500
+NAME                     TYPE                       DATA   AGE
+pg-cluster-app           kubernetes.io/basic-auth   11     3m29s
+pg-cluster-ca            Opaque                     2      3m29s
+pg-cluster-replication   kubernetes.io/tls          2      3m29s
+pg-cluster-server        kubernetes.io/tls          2      3m29s
+pg-cluster-superuser     kubernetes.io/basic-auth   11     68s
+pg-estate-ca             Opaque                     2      48s
+pg-estate-replication    kubernetes.io/tls          2      48s
+pg-estate-server         kubernetes.io/tls          2      48s`,
+              note: 'Databases keep their names and owners, roles keep their attributes, and the role password came across in the dump — shop logs in on the copy with the password it had on the source. Note what is missing from the Secret list: there is no pg-estate-app, because a monolith import creates no application database for the operator to manage.',
+            },
+            {
+              run: `kubectl exec $PRIMARY -c postgres -- psql -U postgres -d orders -c \\
+  "INSERT INTO lines (sku, qty) VALUES ('written-after-the-import', 999);"
+kubectl exec $PRIMARY -c postgres -- psql -U postgres -d orders -tAc "SELECT count(*) FROM lines;"
+kubectl exec pg-orders-1 -c postgres -- psql -U postgres -d app -tAc "SELECT count(*) FROM lines;"`,
+              out: `INSERT 0 1
+501
+500`,
+              note: 'The import is pg_dump read once at bootstrap. Nothing follows the source afterwards — no slot, no WAL receiver, no subscription — which is what makes a cutover a planned outage the length of the dump and restore.',
+            },
+          ],
+          notes: [
+            'The connection is an ordinary PostgreSQL connection described by an `externalClusters` entry, and it must be made as a superuser: pg_dump has to read objects the application user does not own, and a monolith import also runs `pg_dumpall --roles-only`. On a CloudNativePG source that means `spec.enableSuperuserAccess: true`, which creates a `<cluster>-superuser` Secret.',
+            'microservice takes exactly one database and imports no roles at all. If something connected as the role that owned those tables, it has nowhere to connect to after the move.',
+            '`schemaOnly: true` restores only the pre-data and post-data sections, which is how you rehearse the structural half of a migration without moving the rows.',
+            'The work happens inside the new instance\'s initdb Job, so there is nothing extra to watch: `kubectl logs job/<cluster>-1-initdb` is where pg_dump and pg_restore report progress.',
+          ],
+        },
+        {
+          id: 'basebackup-clone',
+          name: 'spec.bootstrap.pg_basebackup (without a replica stanza)',
+          summary:
+            'Copies a running cluster physically, over the streaming replication protocol, and starts the copy as its own primary. The same block with a `replica` stanza would produce a standby; without one it produces an independent database.',
+          usedIn: ['cnpg-basebackup-clone'],
+          examples: [
+            {
+              run: `kubectl apply -f /root/clone.yaml
+kubectl get pods | grep clone
+kubectl get cluster`,
+              out: `cluster.postgresql.cnpg.io/pg-clone created
+pg-clone-1-pgbasebackup-k8xnx   0/1     Completed   0          18s
+NAME         AGE    INSTANCES   READY   STATUS                     PRIMARY
+pg-clone     36s    1           1       Cluster in healthy state   pg-clone-1
+pg-cluster   3m8s   3           3       Cluster in healthy state   pg-cluster-1`,
+              note: 'The copy runs in its own Job — the pgbasebackup Pod — and the cluster reports "Setting up primary" rather than "Creating a new replica" while it does. Thirty-six seconds for a small database on a quiet machine.',
+            },
+            {
+              run: `kubectl exec pg-clone-1 -c postgres -- psql -U postgres -tAc "SELECT pg_is_in_recovery();"
+kubectl exec pg-clone-1 -c postgres -- psql -U postgres -tAc "SELECT count(*) FROM pg_stat_wal_receiver;"
+SRC=$(kubectl get secret pg-cluster-app -o jsonpath='{.data.password}' | base64 -d)
+kubectl exec psql-client -- env PGPASSWORD="$SRC" psql -h pg-clone-rw -U app -d app -tAc "SELECT 1;"`,
+              out: `f
+0
+psql: error: connection to server at "pg-clone-rw" (10.43.11.95), port 5432 failed: FATAL:  password authentication failed for user "app"`,
+              note: 'Not in recovery and receiving nothing — a primary in its own right. Every role arrived with the source\'s password inside the copied data directory, and then the operator reset the application user to the clone\'s own generated Secret.',
+            },
+            {
+              run: `kubectl exec psql-client -- env PGPASSWORD="$NEW" psql -h pg-clone-rw -U app -d app -c "INSERT INTO notes (entry) VALUES ('written on the clone') RETURNING id, entry;"
+kubectl exec psql-client -- psql -h pg-cluster-rw -c "INSERT INTO notes (entry) VALUES ('written on the source') RETURNING id, entry;"
+kubectl get cluster pg-cluster -o jsonpath='{.status.timelineID}{"\\n"}'
+kubectl get cluster pg-clone -o jsonpath='{.status.timelineID}{"\\n"}'`,
+              out: ` id |        entry
+----+----------------------
+ 51 | written on the clone
+ id |         entry
+----+-----------------------
+ 51 | written on the source
+1
+1`,
+              note: 'Both sequences were copied at the same value, so the same id now means two different rows on two different clusters. And both are still on timeline 1: a clone is never promoted, it simply starts as a primary — so never let two of these share a WAL archive.',
+            },
+          ],
+          notes: [
+            'The copy is taken over the streaming replication protocol, so the `externalClusters` entry authenticates as `streaming_replica` with the source\'s certificates rather than with an application password.',
+            'Physical means whole: every database, every role and every setting come across, not one application\'s tables.',
+            'A clone is useless as a backup. From the moment it finishes there are two databases diverging independently, and no path back to one consistent copy.',
           ],
         },
         {
@@ -1627,6 +2245,133 @@ kubectl get node $NODE -o json | jq -c '.spec.taints'`,
             '`operator: Equal` with a `value` matches that exact taint; `operator: Exists` with just the key tolerates any value for it.',
             '`kubectl taint node <name> key=value:Effect` adds one; the same command with a trailing `-` removes it.',
             'Tolerating a taint is right when a node is reserved for a purpose and your database is that purpose — and wrong when the taint means maintenance, where it amounts to insisting on running exactly where somebody said not to.',
+          ],
+        },
+        {
+          id: 'node-selector-affinity',
+          name: 'spec.affinity (nodeSelector, podAntiAffinityType, topologyKey)',
+          summary:
+            'Where instances may run and how hard the operator tries to spread them. A Cluster nobody has touched already carries a defaulted anti-affinity preference; the rule it expands into is only visible on the Pods.',
+          usedIn: ['cnpg-node-selector'],
+          examples: [
+            {
+              run: `kubectl get cluster pg-cluster -o json | jq -c '.spec.affinity'
+kubectl get pod pg-cluster-1 -o json | jq '.spec.affinity'`,
+              out: `{"podAntiAffinityType":"preferred"}
+{
+  "podAntiAffinity": {
+    "preferredDuringSchedulingIgnoredDuringExecution": [
+      {
+        "podAffinityTerm": {
+          "labelSelector": {
+            "matchExpressions": [
+              {
+                "key": "cnpg.io/cluster",
+                "operator": "In",
+                "values": [
+                  "pg-cluster"
+                ]
+              },
+              {
+                "key": "cnpg.io/podRole",
+                "operator": "In",
+                "values": [
+                  "instance"
+                ]
+              }
+            ]
+          },
+          "topologyKey": "kubernetes.io/hostname"
+        },
+        "weight": 100
+      }
+    ]
+  }
+}`,
+              note: 'The single word in the Cluster is defaulted in by the operator\'s webhook. The topology key it spreads across appears nowhere in the Cluster spec until you set one — read it off a Pod.',
+            },
+            {
+              run: `SERVER=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+kubectl label node $SERVER workload=database
+kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"affinity":{"nodeSelector":{"workload":"database"}}}}'
+kubectl get pods -l cnpg.io/cluster=pg-cluster -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+kubectl get events --field-selector reason=FailedScheduling,involvedObject.name=pg-cluster-2`,
+              out: `node/k3d-dbol-0678aad72171-server-0 labeled
+cluster.postgresql.cnpg.io/pg-cluster patched
+NAME           NODE                             STATUS
+pg-cluster-1   k3d-dbol-0678aad72171-agent-1    Running
+pg-cluster-2   <none>                           Pending
+pg-cluster-3   k3d-dbol-0678aad72171-server-0   Running
+LAST SEEN   TYPE      REASON             OBJECT             MESSAGE
+28s         Warning   FailedScheduling   pod/pg-cluster-2   0/3 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.`,
+              note: 'Changing the selector rolls the cluster, and the first Pod rebuilt cannot be placed: two nodes lack the label, and the one that has it is not the node holding this instance\'s local-path volume. Labelling the remaining nodes scheduled it within seconds, with no change to the Cluster.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"affinity":{"podAntiAffinityType":"required","topologyKey":"kubernetes.io/os"}}}'
+kubectl get events --field-selector reason=FailedScheduling,involvedObject.name=pg-cluster-3
+kubectl get pod pg-cluster-3 -o json | jq -c '.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution'`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+LAST SEEN   TYPE      REASON             OBJECT             MESSAGE
+47s         Warning   FailedScheduling   pod/pg-cluster-3   0/3 nodes are available: 1 node(s) didn't match pod anti-affinity rules, 2 node(s) didn't match PersistentVolume's node affinity. no new claims to deallocate, preemption: 0/3 nodes are available: 1 No preemption victims found for incoming pod, 2 Preemption is not helpful for scheduling.
+[{"labelSelector":{"matchExpressions":[{"key":"cnpg.io/cluster","operator":"In","values":["pg-cluster"]},{"key":"cnpg.io/podRole","operator":"In","values":["instance"]}]},"topologyKey":"kubernetes.io/os"}]`,
+              note: 'Every node reports the same kubernetes.io/os, so a required spread across it has one domain and only one instance may occupy it. The generated term moves out of the preferred list and loses its weight.',
+            },
+          ],
+          notes: [
+            'A nodeSelector is a hard filter with no weights and no fallback, and the operator writes it onto every instance Pod — so changing it triggers a rolling update rather than taking effect on the running Pods.',
+            'The rollout deliberately stalls while an instance is Pending: the operator will not take a second one away while the cluster is degraded. Mid-stall the Pods disagree about their own scheduling policy, since only the rebuilt one carries the new rule.',
+            'The single-zone trap: a `required` spread over `topology.kubernetes.io/zone` in a one-zone cluster leaves every instance after the first unschedulable, and the message names the anti-affinity rule rather than the zone.',
+            'Tolerations live under this same `spec.affinity` block, which is a slightly surprising place for them — they are about taints, not affinity.',
+          ],
+        },
+        {
+          id: 'podspec-drift',
+          name: 'cnpg.io/podSpec (drift detection)',
+          summary:
+            'The operator\'s own record of the Pod spec it generated, kept as an annotation on each instance Pod. Reconciliation compares that record with a freshly generated spec, and any difference rolls the Pod.',
+          usedIn: ['cnpg-podspec-drift'],
+          examples: [
+            {
+              run: `kubectl get pod pg-cluster-1 -o json | jq -S '.metadata.annotations | keys'
+kubectl get pod pg-cluster-1 -o jsonpath='{.metadata.annotations.cnpg\\.io/podSpec}' \\
+  | jq -c '{grace: .terminationGracePeriodSeconds, resources: .containers[0].resources, image: .containers[0].image}'`,
+              out: `[
+  "cnpg.io/nodeSerial",
+  "cnpg.io/operatorVersion",
+  "cnpg.io/podEnvHash",
+  "cnpg.io/podSpec"
+]
+{"grace":1800,"resources":{},"image":"ghcr.io/cloudnative-pg/postgresql:18.4-system-trixie"}`,
+              note: 'The annotation\'s value is a whole Pod spec as a JSON string, so it needs unwrapping before jq can read it. 1800 seconds is the shutdown grace period the operator gives PostgreSQL.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"resources":{"requests":{"cpu":"100m","memory":"512Mi"},"limits":{"memory":"1Gi"}}}}'
+kubectl get cluster pg-cluster --no-headers
+kubectl get pods -l cnpg.io/cluster=pg-cluster -o json | jq -r '.items[] | [.metadata.name, .metadata.creationTimestamp, .metadata.labels["cnpg.io/instanceRole"]] | @tsv' | sort -k2`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+pg-cluster   3m18s   3     2     Primary instance is being restarted without a switchover   pg-cluster-1
+pg-cluster-3	2026-08-16T17:34:59Z	replica
+pg-cluster-2	2026-08-16T17:35:12Z	replica
+pg-cluster-1	2026-08-16T17:35:25Z	primary`,
+              note: 'A resources change replaces every Pod — replicas first at roughly 15-second intervals, primary last, the whole roll under a minute. The primary\'s Pod is new; the primary instance is the same one it was.',
+            },
+            {
+              run: `kubectl annotate pod pg-cluster-2 'cnpg.io/podSpec={"tampered":true}' --overwrite
+for i in 1 2 3 4 5 6; do kubectl get pod pg-cluster-2 --no-headers -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp,PHASE:.status.phase; sleep 3; done`,
+              out: `pod/pg-cluster-2 annotated
+pg-cluster-2   2026-08-16T17:35:12Z   Running
+pg-cluster-2   2026-08-16T17:36:13Z   Pending
+pg-cluster-2   2026-08-16T17:36:13Z   Running
+pg-cluster-2   2026-08-16T17:36:13Z   Running
+pg-cluster-2   2026-08-16T17:36:13Z   Running
+pg-cluster-2   2026-08-16T17:36:13Z   Running`,
+              note: 'Nothing about the container changed — only the operator\'s record of it — and the Pod was deleted and rebuilt within about three seconds, with the real spec written back. Drift is measured against the annotation.',
+            },
+          ],
+          notes: [
+            'A label of your own on the same Pod survives untouched: the operator enforces the record it keeps and the labels it routes on, not an identical copy of the object it created.',
+            'This is why a mutating admission webhook or policy engine that rewrites CloudNativePG\'s Pods produces an endless rolling update. Exclude those Pods from the mutation rather than trying to make the operator less strict.',
+            '`cnpg.io/podEnvHash` differs per instance and `cnpg.io/nodeSerial` is the number in the instance name — neither is part of the drift comparison.',
           ],
         },
         {
@@ -1815,6 +2560,535 @@ pg-cluster-3   ghcr.io/cloudnative-pg/postgresql:18.4-system-trixie   2026-08-16
             'None of this applies to a *major* version upgrade, which changes the on-disk format and is a different operation entirely.',
           ],
         },
+        {
+          id: 'multi-arch-images',
+          name: 'Reading a multi-arch image from the registry (curl + jq)',
+          summary:
+            'A tag usually names an index listing one image per platform, not an image. Following it down to the config blob is how you find out what an image was really built for — and it is exactly what the container runtime does when it pulls.',
+          usedIn: ['cnpg-multi-arch'],
+          examples: [
+            {
+              run: `kubectl get nodes -o custom-columns=NAME:.metadata.name,ARCH:.status.nodeInfo.architecture,OS:.status.nodeInfo.operatingSystem
+kubectl exec pg-cluster-1 -c postgres -- uname -m
+kubectl exec pg-cluster-1 -c postgres -- dpkg --print-architecture
+kubectl -n cnpg-system logs deploy/cnpg-controller-manager | grep "Kubernetes system metadata" | tail -1`,
+              out: `NAME                             ARCH    OS
+k3d-dbol-a2fee4093894-agent-0    arm64   linux
+k3d-dbol-a2fee4093894-agent-1    arm64   linux
+k3d-dbol-a2fee4093894-server-0   arm64   linux
+aarch64
+arm64
+{"level":"info","ts":"2026-08-16T17:47:36.621208781Z","logger":"setup","msg":"Kubernetes system metadata","haveSCC":false,"haveVolumeSnapshot":false,"availableArchitectures":[{"GoArch":"amd64"},{"GoArch":"arm64"}]}`,
+              note: 'Three vocabularies for one fact: the kernel says aarch64, Debian says arm64, and Kubernetes uses Debian\'s word. The operator logs which architectures it can supply an instance manager binary for — both of them, from one image.',
+            },
+            {
+              run: `REPO=cloudnative-pg/postgresql
+TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:$REPO:pull" | jq -r .token)
+curl -s -H "Authorization: Bearer $TOKEN" \\
+     -H "Accept: application/vnd.oci.image.index.v1+json" \\
+     "https://ghcr.io/v2/$REPO/manifests/18.4-system-trixie" | jq '{mediaType, manifests: [.manifests[] | {digest, platform}]}'`,
+              out: `{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "digest": "sha256:e6e1f467b52112f7e08aa380de81473106ff54b1834d90bcb4265a2a018e1921",
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "digest": "sha256:96b1695c6fc629bbc809ec49946349cfbd4785d18c7dbeeb5bfb9d9892b807e0",
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    },
+    {
+      "digest": "sha256:e296f47170cba3643907e8dc8f070d85646113cb03db9e89a00391d181167ef1",
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "digest": "sha256:4dfa63ca6e96c20c4c51fed924bcb4555cb09d18c8ab377d034f11f7402f4994",
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    }
+  ]
+}`,
+              note: 'A public image still needs an anonymous pull token. The two unknown/unknown entries are the build attestations — signed provenance and an SBOM — not images; a runtime skips them by matching on platform.',
+            },
+            {
+              run: `DIGEST=sha256:96b1695c6fc629bbc809ec49946349cfbd4785d18c7dbeeb5bfb9d9892b807e0
+curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.manifest.v1+json" \\
+     "https://ghcr.io/v2/$REPO/manifests/$DIGEST" | jq '{mediaType, config: .config, layers: (.layers | length)}'
+CONFIG=$(curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.manifest.v1+json" "https://ghcr.io/v2/$REPO/manifests/$DIGEST" | jq -r .config.digest)
+curl -sL -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/$REPO/blobs/$CONFIG" | jq -c '{architecture, os, variant, created}'`,
+              out: `{
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:5abb9e6a008e689578b7e3ebe8f8959ab41f5681708b1ba8daa8afcae5c9779a",
+    "size": 6382
+  },
+  "layers": 5
+}
+{"architecture":"arm64","os":"linux","variant":null,"created":"2026-08-13T07:46:34.613794085Z"}`,
+              note: 'The manifest at a platform digest has no `manifests` list — a config and some layers, one image. The config blob is where the image itself states its architecture, and it comes from the /blobs/ endpoint with -L, because registries redirect blob downloads to storage.',
+            },
+          ],
+          notes: [
+            'Both index and manifest media types have to be offered in `Accept`. Without them a registry may answer with an older single-platform conversion instead.',
+            '`kubernetes.io/arch` is a standard node label, so restricting a workload to one architecture is an ordinary node selector rather than a special mechanism.',
+            'Pinning by an *index* digest keeps the multi-architecture property; pinning by a single image\'s digest ties the manifest to one architecture and fails to schedule anywhere else.',
+            'A Pod\'s `imageID` will not match the index entry in this environment, because the images are side-loaded into the k3d nodes rather than pulled — the local re-pack has its own digest.',
+          ],
+        },
+        {
+          id: 'managed-roles',
+          name: 'spec.managed.roles (declaring a database role)',
+          summary:
+            'Puts a role in the Cluster definition instead of in somebody’s shell history: name, ensure, attributes, and a Secret holding the password. The operator makes the database match.',
+          usedIn: ['cnpg-managed-roles'],
+          examples: [
+            {
+              run: `kubectl create secret generic analyst-password \\
+  --from-literal=username=analyst --from-literal=password=analyst_pw
+kubectl patch cluster pg-cluster --type=merge -p '{
+  "spec": {"managed": {"roles": [
+    {"name": "analyst", "ensure": "present", "login": true,
+     "comment": "read-only reporting account",
+     "passwordSecret": {"name": "analyst-password"}}
+  ]}}}'
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "SELECT rolname, rolcanlogin, rolcreatedb, rolconnlimit FROM pg_roles WHERE rolname = 'analyst';"`,
+              out: `secret/analyst-password created
+cluster.postgresql.cnpg.io/pg-cluster patched
+ rolname | rolcanlogin | rolcreatedb | rolconnlimit
+---------+-------------+-------------+--------------
+ analyst | t           | f           |           -1
+(1 row)`,
+              note: 'The role appeared within about fifteen seconds. `rolconnlimit -1` is the default: no limit.',
+            },
+            {
+              run: `kubectl exec psql-client -- env PGPASSWORD=analyst_pw \\
+  psql -h pg-cluster-rw -U analyst -d app -tAc "SELECT current_user, session_user;"
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = 'analyst';"`,
+              out: `analyst|analyst
+read-only reporting account`,
+              note: 'The password never appears in a manifest, and `COMMENT ON ROLE` is part of what the operator maintains.',
+            },
+            {
+              run: `kubectl get cluster pg-cluster -o jsonpath='{.status.managedRolesStatus}{"\\n"}'`,
+              out: '{"byStatus":{"not-managed":["app"],"reconciled":["analyst"],"reserved":["postgres","cnpg_metrics_exporter","streaming_replica"]},"passwordStatus":{"analyst":{"resourceVersion":"1348","transactionID":757}}}',
+              note: '`reserved` are the operator’s own roles, which it will not let you manage; `not-managed` exists but has not been asked for; `passwordStatus` records the Secret version and the transaction the password was set in.',
+            },
+          ],
+          notes: [
+            'The Secret needs both a `username` and a `password` key, and `username` must equal the role name — otherwise the operator declines to use it.',
+            '`spec.managed.roles` is a list, so a merge patch replaces it wholesale: an entry re-sent without its `login` or its `passwordSecret` loses them.',
+            'Other fields the operator maintains: `createdb`, `createrole`, `superuser`, `inherit`, `bypassrls`, `connectionLimit`, `inRoles`, `validUntil` and `disablePassword`.',
+          ],
+        },
+        {
+          id: 'managed-roles-drift',
+          name: 'status.managedRolesStatus (drift and cannotReconcile)',
+          summary:
+            'The two edges of managed roles: a change made in SQL is not reverted, and an ensure: absent PostgreSQL refuses is reported rather than retried into oblivion.',
+          usedIn: ['cnpg-managed-roles'],
+          examples: [
+            {
+              run: `kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "ALTER ROLE analyst NOLOGIN;"
+for i in $(seq 1 10); do
+  printf "%s " "$(date +%T)"
+  kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'analyst';"
+  sleep 6
+done
+kubectl get cluster pg-cluster -o jsonpath='{.status.managedRolesStatus}{"\\n"}'`,
+              out: `ALTER ROLE
+01:18:46 f
+01:18:53 f
+01:18:59 f
+01:19:05 f
+01:19:11 f
+{"byStatus":{"not-managed":["app"],"reconciled":["analyst"],"reserved":["postgres","cnpg_metrics_exporter","streaming_replica"]},"passwordStatus":{"analyst":{"resourceVersion":"1283","transactionID":759}}}`,
+              note: 'Elided: it stayed `f` for a further three minutes. The status goes on saying `reconciled` while the database and the spec disagree.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"managed":{"roles":[{"name":"analyst","ensure":"present","login":true,"createdb":true,"connectionLimit":10,"comment":"read-only reporting account","passwordSecret":{"name":"analyst-password"}}]}}}'
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "SELECT rolname, rolcanlogin, rolcreatedb, rolconnlimit FROM pg_roles WHERE rolname = 'analyst';"`,
+              out: ` rolname | rolcanlogin | rolcreatedb | rolconnlimit
+---------+-------------+-------------+--------------
+ analyst | t           | t           |           10
+(1 row)`,
+              note: 'Any change to the entry makes the operator apply the whole role again, so LOGIN comes back alongside the limit that was actually asked for.',
+            },
+            {
+              run: `kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -d app -c "CREATE TABLE reports (id serial primary key, title text); ALTER TABLE reports OWNER TO analyst;"
+kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"managed":{"roles":[{"name":"analyst","ensure":"absent"}]}}}'
+kubectl get cluster pg-cluster -o jsonpath='{.status.managedRolesStatus}{"\\n"}'
+kubectl get cluster pg-cluster`,
+              out: `CREATE TABLE
+ALTER TABLE
+cluster.postgresql.cnpg.io/pg-cluster patched
+{"byStatus":{"not-managed":["app"],"pending-reconciliation":["analyst"],"reserved":["postgres","cnpg_metrics_exporter","streaming_replica"]},"cannotReconcile":{"analyst":["could not perform DELETE on role analyst: 2 objects in database app"]},"passwordStatus":{"analyst":{"resourceVersion":"1348","transactionID":772}}}
+NAME         AGE     INSTANCES   READY   STATUS                     PRIMARY
+pg-cluster   4m33s   3           3       Cluster in healthy state   pg-cluster-1`,
+              note: 'Two objects, not one: the table and the sequence behind its `serial` column. The cluster stays healthy while the request goes unfulfilled.',
+            },
+            {
+              run: `kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -d app -c "DROP TABLE reports;"
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT count(*) FROM pg_roles WHERE rolname = 'analyst';"
+kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"managed":{"roles":[{"name":"analyst","ensure":"absent","comment":"retired"}]}}}'
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT count(*) FROM pg_roles WHERE rolname = 'analyst';"`,
+              out: `DROP TABLE
+1
+cluster.postgresql.cnpg.io/pg-cluster patched
+0`,
+              note: 'Clearing the obstacle is not enough on its own — the role went only after the spec was touched again.',
+            },
+          ],
+          notes: [
+            'Alert on `status.managedRolesStatus.cannotReconcile` rather than on the cluster’s phase: this is a class of failure that leaves the cluster perfectly healthy.',
+            'Reassign or drop what a role owns before asking for it to be absent — `REASSIGN OWNED BY` and `DROP OWNED BY` are the SQL for a real retirement.',
+            'The mental model is "applied on change", not "enforced continuously". Managed roles are not an audit control.',
+          ],
+        },
+        {
+          id: 'declarative-database',
+          name: 'kind: Database (declarative databases)',
+          summary:
+            'A database as a namespaced object: which Cluster hosts it, what it is called in PostgreSQL, who owns it. The operator issues the CREATE DATABASE and reports in the object’s status.',
+          usedIn: ['cnpg-declarative-databases', 'cnpg-database-reclaim'],
+          examples: [
+            {
+              run: `cat /root/reporting-db.yaml
+kubectl apply -f /root/reporting-db.yaml
+kubectl get database`,
+              out: `apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: reporting-db
+  namespace: default
+spec:
+  cluster:
+    name: pg-cluster
+  name: reporting
+  owner: app
+database.postgresql.cnpg.io/reporting-db created
+NAME           AGE   CLUSTER      PG NAME     APPLIED   MESSAGE
+reporting-db   13s   pg-cluster   reporting   true`,
+              note: 'The object’s name and the database’s name are separate fields. APPLIED turned true in about twelve seconds.',
+            },
+            {
+              run: `kubectl get database reporting-db -o jsonpath='{.spec}{"\\n"}'
+kubectl get database reporting-db -o jsonpath='{.status}{"\\n"}'
+kubectl get database reporting-db -o jsonpath='{.metadata.finalizers}{"\\n"}'`,
+              out: `{"cluster":{"name":"pg-cluster"},"databaseReclaimPolicy":"retain","ensure":"present","name":"reporting","owner":"app"}
+{"applied":true,"observedGeneration":1}
+["cnpg.io/deleteDatabase"]`,
+              note: 'Three things the manifest never said: ensure, databaseReclaimPolicy and the finalizer that lets the operator decide what happens to the database when the object is deleted.',
+            },
+            {
+              run: `kubectl apply -f /root/reporting-dup.yaml
+kubectl get database
+kubectl get database reporting-dup -o jsonpath='{.status}{"\\n"}'`,
+              out: `database.postgresql.cnpg.io/reporting-dup created
+NAME            AGE   CLUSTER      PG NAME     APPLIED   MESSAGE
+reporting-db    35s   pg-cluster   reporting   true
+reporting-dup   13s   pg-cluster   reporting   false     "reporting" is already managed by object "reporting-db"
+{"applied":false,"message":"\\"reporting\\" is already managed by object \\"reporting-db\\""}`,
+              note: 'The apply succeeds — this is not something admission can settle. The refusal lands in the newcomer’s own status, and the first object is untouched.',
+            },
+            {
+              run: `kubectl delete database reporting-db
+kubectl get database
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "\\l" | grep reporting
+kubectl apply -f /root/reporting-db.yaml
+kubectl get database reporting-db -o jsonpath='{.status}{"\\n"}'
+kubectl exec psql-client -- psql -h pg-cluster-rw -d reporting -tAc "SELECT count(*) FROM ledger;"`,
+              out: `database.postgresql.cnpg.io "reporting-db" deleted from default namespace
+No resources found in default namespace.
+ reporting | app      | UTF8     | libc            | C       | C
+database.postgresql.cnpg.io/reporting-db created
+{"applied":true,"observedGeneration":1}
+3`,
+              note: 'Under the default retain policy the database and its rows survive the object, and re-applying the same manifest adopts what is already there rather than failing or recreating it.',
+            },
+          ],
+          notes: [
+            'Adoption is by name: an object pointed at an existing database it was never meant to manage will take it over, and the only protection is that a second claim on the same database is refused.',
+            'Other alterable fields the operator maintains: `allowConnections` (a client then gets `FATAL: database "reporting" is not currently accepting connections`) and `connectionLimit` (`datconnlimit`).',
+            'A database left behind by a deleted object keeps its storage and its cost, with nothing in Kubernetes to remind you it is there.',
+          ],
+        },
+        {
+          id: 'database-reclaim-policy',
+          name: 'databaseReclaimPolicy and ensure (ending a declared database)',
+          summary:
+            'Two different fields that both end with a database gone: one fires when the object is deleted, the other while it still exists.',
+          usedIn: ['cnpg-database-reclaim'],
+          examples: [
+            {
+              run: `kubectl get database -o custom-columns=OBJECT:.metadata.name,PGNAME:.spec.name,POLICY:.spec.databaseReclaimPolicy,ENSURE:.spec.ensure,APPLIED:.status.applied`,
+              out: `OBJECT    PGNAME   POLICY   ENSURE    APPLIED
+keep-db   keepdb   retain   present   true
+temp-db   tempdb   delete   present   true`,
+              note: 'The policy has no effect at all while the object exists, which is why it is easy to set carelessly.',
+            },
+            {
+              run: `kubectl exec psql-client -- psql -h pg-cluster-rw -d tempdb -c "SELECT pg_sleep(90);" &
+kubectl delete database temp-db --wait=false
+kubectl get database
+kubectl get database temp-db -o jsonpath='{"deletionTimestamp="}{.metadata.deletionTimestamp}{" finalizers="}{.metadata.finalizers}{"\\n"}'
+kubectl describe database temp-db | tail -4
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT count(*) FROM pg_database WHERE datname = 'tempdb';"`,
+              out: `database.postgresql.cnpg.io "temp-db" deleted from default namespace
+NAME      AGE   CLUSTER      PG NAME   APPLIED   MESSAGE
+keep-db   36s   pg-cluster   keepdb    true
+temp-db   36s   pg-cluster   tempdb    true
+deletionTimestamp=2026-08-17T04:57:54Z finalizers=["cnpg.io/deleteDatabase"]
+Status:
+  Applied:              true
+  Observed Generation:  1
+Events:                 <none>
+1`,
+              note: 'PostgreSQL will not drop a database with a session on it, so the deletion waits on the finalizer. No event, no message, status still applied: true — and a plain kubectl delete would simply not return.',
+            },
+            {
+              run: `wait
+kubectl get database
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "\\l" | head -6`,
+              out: `NAME      AGE    CLUSTER      PG NAME   APPLIED   MESSAGE
+keep-db   2m3s   pg-cluster   keepdb    true
+   Name    |  Owner   | Encoding | Locale Provider | Collate | Ctype
+-----------+----------+----------+-----------------+---------+-------
+ app       | app      | UTF8     | libc            | C       | C
+ keepdb    | app      | UTF8     | libc            | C       | C`,
+              note: 'The session ended, the object went, and tempdb went with it. keepdb, on the other policy, is untouched. Columns elided.',
+            },
+            {
+              run: `kubectl patch database keep-db --type=merge -p '{"spec":{"ensure":"absent"}}'
+kubectl get database
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT count(*) FROM pg_database WHERE datname = 'keepdb';"
+kubectl get database keep-db -o custom-columns=OBJECT:.metadata.name,ENSURE:.spec.ensure,POLICY:.spec.databaseReclaimPolicy,APPLIED:.status.applied`,
+              out: `database.postgresql.cnpg.io/keep-db patched
+NAME      AGE     CLUSTER      PG NAME   APPLIED   MESSAGE
+keep-db   2m30s   pg-cluster   keepdb    true
+0
+OBJECT    ENSURE   POLICY   APPLIED
+keep-db   absent   retain   true`,
+              note: 'ensure: absent dropped the database on an object whose reclaim policy says retain — the policy was never consulted, because the object was never deleted.',
+            },
+          ],
+          notes: [
+            'Three separate decisions: `ensure` is whether the database exists now, `databaseReclaimPolicy` is what happens if the object is deleted, and having an object at all is whether the operator manages it.',
+            '`ensure` is reversible in the ordinary way — set it back to present and the operator creates the database again, empty. A reclaim policy only fires when there is no object left to change your mind with.',
+            'With `delete`, removing the object is a destructive database operation wearing Kubernetes clothes, and it can hang indefinitely on an idle connection from an application nobody has scaled down.',
+          ],
+        },
+        {
+          id: 'major-upgrade',
+          name: 'spec.imageName across a major version (declarative pg_upgrade)',
+          summary:
+            'The same field a minor upgrade uses. A changed major has the operator stop the database, run pg_upgrade in place on the primary, and rebuild every replica from it.',
+          usedIn: ['cnpg-major-upgrade'],
+          examples: [
+            {
+              run: `kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT version();"
+kubectl get cluster pg-cluster -o jsonpath='{.status.image}|{.status.pgDataImageInfo}{"\\n"}'`,
+              out: `PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+ghcr.io/cloudnative-pg/postgresql:17-system-trixie|{"image":"ghcr.io/cloudnative-pg/postgresql:17-system-trixie","majorVersion":17}`,
+              note: '`status.pgDataImageInfo` is what the operator compares against to notice a major change at all — the image that last ran on this data directory.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18.4-system-trixie"}}'
+for i in $(seq 1 18); do
+  printf "%s | " "$(date +%T)"
+  kubectl get cluster pg-cluster --no-headers
+  kubectl get pods --no-headers | grep -v psql-client
+  echo
+  sleep 8
+done`,
+              out: `07:04:45 | pg-cluster 2m55s 3   Upgrading Postgres major version pg-cluster-1
+pg-cluster-1-major-upgrade-qght8 1/1 Running 0 6s
+07:05:09 | pg-cluster 3m20s 3   Upgrading Postgres major version pg-cluster-1
+pg-cluster-1-major-upgrade-qght8 0/1 Completed 0 31s
+07:05:26 | pg-cluster 3m36s 2 1 Creating a new replica pg-cluster-1
+pg-cluster-1 1/1 Running 0 14s
+pg-cluster-2-join-p85ph 0/1 Pending 0 2s`,
+              note: 'All three instances stop, the upgrade Job runs ~31s, the primary comes back on the new image, then each replica is rebuilt by an ordinary join Job. Rows elided; healthy again about two minutes after the patch.',
+            },
+            {
+              run: `kubectl get job pg-cluster-1-major-upgrade -o jsonpath='{range .spec.template.spec.initContainers[*]}INIT {.name} {.image}{"\\n"}{end}{range .spec.template.spec.containers[*]}MAIN {.name} {.image}{"\\n"}{end}'
+kubectl logs job/pg-cluster-1-major-upgrade --all-containers | tail -6`,
+              out: `INIT bootstrap-controller ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0
+INIT prepare ghcr.io/cloudnative-pg/postgresql:17-system-trixie
+MAIN major-upgrade ghcr.io/cloudnative-pg/postgresql:18.4-system-trixie
+{"msg":"Copying the PostgreSQL installation to the destination","destination":"/controller/old"}
+{"msg":"Creating the bindir.txt file","file":"/controller/old/bindir.txt"}
+{"msg":"Copying the files","source":"/usr/lib/postgresql/17/bin","destination":"/controller/old/usr/lib/postgresql/17/bin"}
+{"msg":"Copying the files","source":"/usr/share/postgresql/17","destination":"/controller/old/usr/share/postgresql/17"}`,
+              note: 'The `prepare` init container runs the *old* image and copies its installation to /controller/old — that is pg_upgrade’s --old-bindir. Catch the Job in a loop: it is deleted as soon as it succeeds. Log timestamps and levels elided.',
+            },
+            {
+              run: `kubectl get pvc -o custom-columns=NAME:.metadata.name,AGE:.metadata.creationTimestamp,VOLUME:.spec.volumeName
+kubectl exec pg-cluster-1 -c postgres -- sh -c 'ls /var/lib/postgresql/data/'`,
+              out: `NAME           AGE                    VOLUME
+pg-cluster-1   2026-08-17T07:01:52Z   pvc-e0824a14-8e5f-4dbb-9ea0-78f7bbff714a
+pg-cluster-2   2026-08-17T07:05:24Z   pvc-61e05835-ee69-425e-8e3d-c8a493be316c
+pg-cluster-3   2026-08-17T07:06:07Z   pvc-22cab4b0-b69f-428c-b210-b19c9513e9e0
+pgdata`,
+              note: 'The primary’s claim predates the upgrade; the replicas’ were created during it. One pgdata directory on the volume — no copy of the old cluster is kept.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"imageName":"ghcr.io/cloudnative-pg/postgresql:17-system-trixie"}}'`,
+              out: 'The Cluster "pg-cluster" is invalid: spec.imageName: Invalid value: "17": can\'t downgrade from major 18 to 17',
+              note: 'Refused at admission, so nothing is written — and nothing is reversible. The route back is a backup taken before the upgrade.',
+            },
+            {
+              run: `kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -d app -c "SELECT relname, reltuples, (SELECT count(*) FROM pg_stats WHERE tablename = c.relname) AS stat_columns FROM pg_class c WHERE relname = 'notes';"
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -d app -c "ANALYZE notes;"
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -d app -c "SELECT relname, reltuples, (SELECT count(*) FROM pg_stats WHERE tablename = c.relname) AS stat_columns FROM pg_class c WHERE relname = 'notes';"`,
+              out: ` relname | reltuples | stat_columns
+---------+-----------+--------------
+ notes   |        -1 |            0
+(1 row)
+
+ANALYZE
+ relname | reltuples | stat_columns
+---------+-----------+--------------
+ notes   |        50 |            2
+(1 row)`,
+              note: 'pg_upgrade does not carry optimizer statistics: reltuples -1 is "never analysed". ANALYZE — vacuumdb --analyze-in-stages on a real database — is the last step of the upgrade.',
+            },
+            {
+              run: `for c in pg-cluster-1 pg-fresh-1; do
+  printf "%-14s " "$c"
+  kubectl exec $c -c postgres -- psql -U postgres -tAc "SELECT 'server_version=' || current_setting('server_version') || ' data_checksums=' || current_setting('data_checksums');"
+done`,
+              out: `pg-cluster-1   server_version=18.4 (Debian 18.4-1.pgdg13+1) data_checksums=off
+pg-fresh-1     server_version=18.4 (Debian 18.4-1.pgdg13+1) data_checksums=on`,
+              note: 'Same image, two answers: the upgraded cluster keeps what PostgreSQL 17’s initdb decided, because no initdb ever ran on it. pg-fresh is a single-instance cluster bootstrapped from the 18 image for the comparison.',
+            },
+          ],
+          notes: [
+            'The old image must still be pullable at upgrade time — the `prepare` init container runs it to stage the old binaries.',
+            'The replica rebuild, not pg_upgrade, is what takes the time on a real database: each one is a fresh pg_basebackup.',
+            'Plan the upgrade as an outage on the primary plus a full replica rebuild, with a backup taken first, because admission will not let you change your mind.',
+          ],
+        },
+        {
+          id: 'role-password-rotation',
+          name: 'Rotating a managed role password (kubectl patch secret + cnpg.io/reload)',
+          summary:
+            'The password lives in a Secret, so rotation is a patch on the Secret — but only if that Secret carries the label that puts it in the operator\'s watch set. Without it, nothing happens and nothing complains.',
+          usedIn: ['cnpg-role-passwords'],
+          examples: [
+            {
+              run: `kubectl patch secret analyst-password -p '{"stringData":{"password":"analyst_2026"}}'
+kubectl get secret analyst-password -o jsonpath='{.data.password}' | base64 -d; echo
+for i in $(seq 1 6); do
+  printf "%s new=" "$(date +%T)"
+  kubectl exec psql-client -- env PGPASSWORD=analyst_2026 psql -h pg-cluster-rw -U analyst -d app -tAc "SELECT 1;" 2>/dev/null | tr -d '\\n'
+  printf " old="
+  kubectl exec psql-client -- env PGPASSWORD=analyst_pw psql -h pg-cluster-rw -U analyst -d app -tAc "SELECT 1;" 2>/dev/null | tr -d '\\n'
+  echo
+  sleep 8
+done`,
+              out: `secret/analyst-password patched
+analyst_2026
+03:36:08 new= old=1
+03:36:16 new= old=1
+03:36:24 new= old=1
+03:36:33 new= old=1
+03:36:41 new= old=1
+03:36:49 new= old=1`,
+              note: 'The Secret holds the new password and the database keeps taking the old one. Watched for six minutes in a separate run with the same result — this does not resolve itself.',
+            },
+            {
+              run: `kubectl get secret analyst-password -o jsonpath='{.metadata.resourceVersion}{"\\n"}'
+kubectl get cluster pg-cluster -o jsonpath='{.status.managedRolesStatus.passwordStatus.analyst.resourceVersion}{"\\n"}'`,
+              out: `1385
+1342`,
+              note: 'The one-line diagnosis: where the Secret is now, against the version of it the operator acted on.',
+            },
+            {
+              run: `kubectl get secret pg-cluster-app --show-labels
+kubectl get secret analyst-password --show-labels`,
+              out: `pg-cluster-app     kubernetes.io/basic-auth   11   3m46s   app.kubernetes.io/managed-by=cloudnative-pg,cnpg.io/cluster=pg-cluster,cnpg.io/reload=true,cnpg.io/userType=app
+analyst-password   Opaque                     2    70s     <none>`,
+              note: 'The operator labels its own Secrets `cnpg.io/reload=true`. A Secret you create by hand has no labels, which is why the mechanism is easy to miss.',
+            },
+            {
+              run: `kubectl label secret analyst-password cnpg.io/reload=true
+kubectl get cluster pg-cluster -o jsonpath='{.status.managedRolesStatus.passwordStatus}{"\\n"}'`,
+              out: `secret/analyst-password labeled
+{"analyst":{"resourceVersion":"1460","transactionID":770}}`,
+              note: 'Applied about eight seconds after the label: the new password connects, the old one is refused, and the applied version now matches the Secret.',
+            },
+            {
+              run: `kubectl annotate secret analyst-password lab/rotated-at="$(date +%s)" --overwrite
+kubectl get secret analyst-password -o jsonpath='{.metadata.resourceVersion}{"\\n"}'
+kubectl get cluster pg-cluster -o jsonpath='{.status.managedRolesStatus.passwordStatus}{"\\n"}'`,
+              out: `secret/analyst-password annotated
+1678
+{"analyst":{"resourceVersion":"1678","transactionID":772}}`,
+              note: 'Forcing a re-apply without changing the password: any change to the Secret moves its resourceVersion, which is all the operator watches.',
+            },
+          ],
+          notes: [
+            'A password changed with `ALTER ROLE ... PASSWORD` is not reverted — measured over two minutes, with the role reported `reconciled` throughout. Touch the Secret and the operator overwrites it on the next poll.',
+            'The label is `cnpg.io/reload: "true"` on the Secret, not on the Cluster, and it is what makes any hand-made Secret visible to the operator.',
+            '`stringData` in a merge patch writes a plain value without base64; the API server encodes it into `data`.',
+          ],
+        },
+        {
+          id: 'role-password-end',
+          name: 'validUntil and disablePassword (ending a password)',
+          summary:
+            'Two ways to stop a password working without dropping the role: an expiry date written through to PostgreSQL, and removing the password altogether.',
+          usedIn: ['cnpg-role-passwords'],
+          examples: [
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"managed":{"roles":[{"name":"analyst","ensure":"present","login":true,"comment":"reporting account","validUntil":"2026-01-01T00:00:00Z","passwordSecret":{"name":"analyst-password"}}]}}}'
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "SELECT rolname, rolvaliduntil FROM pg_roles WHERE rolname = 'analyst';"
+kubectl exec psql-client -- env PGPASSWORD=analyst_2026 psql -h pg-cluster-rw -U analyst -d app -tAc "SELECT 1;"`,
+              out: ` rolname |     rolvaliduntil
+---------+------------------------
+ analyst | 2026-01-01 00:00:00+00
+(1 row)
+
+psql: error: connection to server at "pg-cluster-rw" (10.43.151.224), port 5432 failed: FATAL:  password authentication failed for user "analyst"`,
+              note: 'PostgreSQL does not tell the client the password expired — this is the same sentence a wrong password produces.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"managed":{"roles":[{"name":"analyst","ensure":"present","login":true,"comment":"reporting account","disablePassword":true,"passwordSecret":{"name":"analyst-password"}}]}}}'`,
+              out: 'The Cluster "pg-cluster" is invalid: spec.managed.roles: Invalid value: "analyst": This role both sets and disables a password',
+              note: 'Refused at admission, so nothing was written and there is nothing to undo.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge -p '{"spec":{"managed":{"roles":[{"name":"analyst","ensure":"present","login":true,"comment":"reporting account","disablePassword":true}]}}}'
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "SELECT rolname, (rolpassword IS NULL) AS no_password, rolvaliduntil FROM pg_authid WHERE rolname = 'analyst';"
+kubectl get cluster pg-cluster -o jsonpath='{.status.managedRolesStatus.passwordStatus}{"\\n"}'`,
+              out: ` rolname | no_password | rolvaliduntil
+---------+-------------+---------------
+ analyst | t           | infinity
+(1 row)
+
+{"analyst":{"transactionID":775}}`,
+              note: 'The password is NULL, the expiry is back to `infinity` because the re-applied entry no longer asks for one, and `passwordStatus` keeps only a transaction id — there is no Secret being tracked any more.',
+            },
+          ],
+          notes: [
+            'The role may still log in after `disablePassword` — it simply has nothing to log in with, which is what you want for a role that authenticates by certificate or by peer.',
+            'The operator re-applies the whole role entry, so a field dropped from the entry is reset in the database, not left alone.',
+            'Through expiry and disabling the role stays under `byStatus.reconciled` and the cluster stays healthy: none of this is a failure, it is what was asked for.',
+          ],
+        },
       ],
     },
 
@@ -1872,6 +3146,61 @@ snapshot-backup   true    pg-cluster-1   csi-hostpath-snapclass`,
           ],
           notes: [
             'CloudNativePG decides whether it supports this method by looking for the VolumeSnapshot CRD **at operator startup**. Install the snapshot API afterwards and every such Backup is rejected with `Cannot use volumeSnapshot backup method due to missing VolumeSnapshot CRD ... please restart it`.',
+          ],
+        },
+        {
+          id: 'snapshot-online-cold',
+          name: 'spec.online on a volumeSnapshot Backup',
+          summary:
+            'One boolean choosing between a snapshot taken while PostgreSQL runs, bracketed by pg_backup_start/stop, and one taken with the instance fenced and shut down. The difference is recorded inside the snapshot.',
+          usedIn: ['cnpg-snapshot-modes'],
+          examples: [
+            {
+              run: `kubectl apply -f /root/cold-backup.yaml
+for i in $(seq 1 10); do
+  printf "%s " "$(date +%T)"; kubectl get backup cold-backup --no-headers | tr '\\n' ' '
+  printf "fenced="; kubectl get cluster pg-cluster -o jsonpath='{.metadata.annotations.cnpg\\.io/fencedInstances}'; echo
+  sleep 5
+done`,
+              out: `backup.postgresql.cnpg.io/cold-backup created
+00:13:55 cold-backup   0s    pg-cluster   volumeSnapshot   started    fenced=["pg-cluster-1"]
+00:14:05 cold-backup   10s   pg-cluster   volumeSnapshot   started    fenced=["pg-cluster-1"]
+00:14:15 cold-backup   20s   pg-cluster   volumeSnapshot   started    fenced=["pg-cluster-1"]
+00:14:25 cold-backup   30s   pg-cluster   volumeSnapshot   completed    fenced=
+00:14:35 cold-backup   40s   pg-cluster   volumeSnapshot   completed    fenced=`,
+              note: 'Output thinned to every other line. The Cluster carries cnpg.io/fencedInstances for the duration — the operator has stopped PostgreSQL without deleting the Pod — and clears it when the backup completes.',
+            },
+            {
+              run: `for s in hot-backup cold-backup; do
+  printf "%-12s " "$s"
+  kubectl get volumesnapshot $s -o jsonpath='{.metadata.annotations.cnpg\\.io/pgControldata}' | grep "Database cluster state"
+done
+kubectl get volumesnapshot cold-backup -o yaml | grep "cnpg.io/backupLabelFile" | wc -l
+kubectl get volumesnapshot hot-backup -o jsonpath='{.metadata.annotations.cnpg\\.io/backupLabelFile}' | base64 -d`,
+              out: `hot-backup   Database cluster state:               in production
+cold-backup  Database cluster state:               shut down
+0
+START WAL LOCATION: 0/3000028 (file 000000010000000000000003)
+CHECKPOINT LOCATION: 0/3000080
+BACKUP METHOD: streamed
+BACKUP FROM: primary
+START TIME: 2026-08-17 00:13:10 UTC
+LABEL: hot-backup
+START TIMELINE: 1`,
+              note: 'The evidence is inside the snapshots. The online one records a running database and carries PostgreSQL\'s own backup label; the cold one records a clean shutdown and has no label, because there was nothing in flight to replay.',
+            },
+            {
+              run: `kubectl get backup -o custom-columns=NAME:.metadata.name,METHOD:.spec.method,ONLINE:.spec.online,PHASE:.status.phase,STARTED:.status.startedAt,STOPPED:.status.stoppedAt`,
+              out: `NAME          METHOD           ONLINE   PHASE       STARTED                STOPPED
+cold-backup   volumeSnapshot   false    completed   2026-08-17T00:13:55Z   2026-08-17T00:14:21Z
+hot-backup    volumeSnapshot   true     completed   2026-08-17T00:13:10Z   2026-08-17T00:13:22Z`,
+              note: 'Read .spec.online, which is what was asked for. In this operator release .status.online reported true for both, so it is not the field to check.',
+            },
+          ],
+          notes: [
+            'Restoring is identical either way — a Cluster whose `bootstrap.recovery.volumeSnapshots` names the snapshot. A cold copy starts without recovery: its log reads "database system was shut down" and then "ready to accept connections".',
+            'The default backup target is `prefer-standby`, so on a replicated cluster a cold backup costs you a replica for half a minute. On a single-instance cluster it costs you the database.',
+            '`spec.backup.volumeSnapshot.online` sets the cluster-wide default; `spec.online` on an individual Backup overrides it.',
           ],
         },
         {
@@ -2150,6 +3479,318 @@ Last Archived WAL:              000000010000000000000008   @   2026-08-15T09:19:
             '"WALs waiting to be archived" climbing is the early warning that a bucket has become unreachable, long before anyone tries to restore.',
           ],
         },
+        {
+          id: 'cnpg-backup-command',
+          name: 'kubectl cnpg backup <cluster> [-m volumeSnapshot] [--online=false] [--backup-name <name>]',
+          summary:
+            'Builds an ordinary Backup resource out of its flags and applies it. Nothing about the result is special: the operator does exactly what it would have done for a manifest, which is why this is safe to reach for in a hurry.',
+          usedIn: ['cnpg-plugin-snapshot-backup'],
+          examples: [
+            {
+              run: `kubectl cnpg backup pg-cluster -m volumeSnapshot
+kubectl get backup -o custom-columns=NAME:.metadata.name,METHOD:.spec.method,ONLINE:.spec.online,TARGET:.spec.target,PHASE:.status.phase
+kubectl get volumesnapshot -o custom-columns=NAME:.metadata.name,READY:.status.readyToUse,SOURCE:.spec.source.persistentVolumeClaimName,SIZE:.status.restoreSize`,
+              out: `backup/pg-cluster-20260817015306 created
+NAME                        METHOD           ONLINE   TARGET   PHASE
+pg-cluster-20260817015306   volumeSnapshot   <none>   <none>   completed
+NAME                        READY   SOURCE         SIZE
+pg-cluster-20260817015306   true    pg-cluster-1   1Gi`,
+              note: 'With no `--backup-name` the plugin composes one from the cluster name and a timestamp. `ONLINE` and `TARGET` read `<none>` because the flags were not given — the Cluster’s own `spec.backup` decides.',
+            },
+            {
+              run: `kubectl cnpg backup pg-cluster -m volumeSnapshot --online=false --backup-name cold-by-plugin
+kubectl get backup cold-by-plugin --no-headers
+kubectl get cluster pg-cluster -o jsonpath='{.metadata.annotations.cnpg\\.io/fencedInstances}{"\\n"}'`,
+              out: `backup/cold-by-plugin created
+cold-by-plugin   6s    pg-cluster   volumeSnapshot   started
+["pg-cluster-1"]`,
+              note: 'While an offline backup runs, the Cluster carries `cnpg.io/fencedInstances` naming the instance whose PostgreSQL has been stopped. It cleared about 31 seconds in, when the backup completed.',
+            },
+            {
+              run: 'kubectl cnpg backup --help',
+              out: `Flags:
+      --backup-name string            The name of the Backup resource that will be created, defaults to "CLUSTER-CURRENT_TIMESTAMP"
+  -t, --backup-target string          If present, will override the backup target defined in cluster, valid values are primary and prefer-standby.
+      --immediate-checkpoint string   Set the '.spec.onlineConfiguration.immediateCheckpoint' field of the Backup resource. …
+  -m, --method string                 If present, will override the backup method defined in backup resource, valid values are: barmanObjectStore, volumeSnapshot, plugin.
+      --online string                 Set the '.spec.online' field of the Backup resource. … Accepted values: true|false|"".
+      --wait-for-archive string       Set the '.spec.onlineConfiguration.waitForArchive' field of the Backup resource. …`,
+              note: 'Elided: the plugin-method flags and the global kubectl flags. Every flag here names the field of the Backup resource it sets.',
+            },
+          ],
+          notes: [
+            '`--online` takes a value rather than being a switch: `--online=false`. Its accepted values are `true|false|""`.',
+            'An empty `spec.online` and an explicit `false` can produce the same backup today and different ones tomorrow — the first follows the Cluster, the second does not.',
+            'The object it creates is an ordinary Backup: `kubectl get backup <name> -o yaml` shows a spec with `cluster`, `method` and `online`, and anything reconciling from Git can read or recreate it.',
+          ],
+        },
+        {
+          id: 'snapshot-pitr',
+          name: 'bootstrap.recovery.volumeSnapshots + recoveryTarget.targetTime (PITR from a snapshot)',
+          summary:
+            'The snapshot supplies the data directory and an externalClusters entry supplies the WAL, so recovery can stop at a chosen moment rather than at the instant the snapshot was taken.',
+          usedIn: ['cnpg-snapshot-pitr'],
+          examples: [
+            {
+              run: `sed "s/TARGET_TIME/$(cat /root/target-time.txt)/" /root/pitr-hot.yaml.template > /root/pitr-hot.yaml
+grep -A 2 recoveryTarget /root/pitr-hot.yaml
+kubectl apply -f /root/pitr-hot.yaml
+kubectl get pods | grep pitr`,
+              out: `        targetTime: "2026-08-17 01:44:22.066635+00"
+  externalClusters:
+cluster.postgresql.cnpg.io/pg-hot-pitr created
+pg-hot-pitr-1-snapshot-recovery-qvp7x   0/2     PodInitializing   0          12s`,
+              note: 'The `…-snapshot-recovery-…` Pod is the recovery itself: it restores the snapshot into a new volume and replays WAL from the object store until it reaches the target.',
+            },
+            {
+              run: `kubectl get pvc pg-hot-pitr-1 -o jsonpath='{.spec.dataSource}{"\\n"}'
+kubectl get pvc pg-cold-pitr-1 -o jsonpath='{.spec.dataSource}{"\\n"}'`,
+              out: `{"apiGroup":"snapshot.storage.k8s.io","kind":"VolumeSnapshot","name":"hot-backup"}
+{"apiGroup":"snapshot.storage.k8s.io","kind":"VolumeSnapshot","name":"cold-backup"}`,
+              note: 'Where each recovered volume came from is recorded on the claim, not on the Cluster.',
+            },
+            {
+              run: `for c in pg-cluster pg-hot-pitr pg-cold-pitr; do
+  printf "%-14s " "$c"
+  kubectl exec \${c}-1 -c postgres -- psql -U postgres -d app -tAc "SELECT string_agg(note, ',' ORDER BY id) FROM pitr_proof;"
+done`,
+              out: `pg-cluster     first,second
+pg-hot-pitr    first
+pg-cold-pitr   first`,
+              note: 'One target time, two snapshots taken in different modes, the same answer: the row committed before the target survives and the one after it does not.',
+            },
+          ],
+          notes: [
+            'Take the target time from the database — `SELECT now()` — not from a node. They are different clocks, and recovery compares against the transaction log.',
+            'Neither recovered row existed when the snapshots were taken; everything after the snapshot came out of the WAL archive. Without an `externalClusters` entry to fetch WAL from, a snapshot restore can only reach the instant it was taken.',
+            'Backups on one cluster serialize: a second Backup applied immediately sits in `pending` until the first finishes.',
+            'Recovery never overwrites its source — each recovered cluster is a new Cluster with its own name, Services and credentials, while the original keeps serving.',
+          ],
+        },
+        {
+          id: 'scheduled-snapshot',
+          name: 'ScheduledBackup with method: volumeSnapshot (and spec.suspend)',
+          summary:
+            'A Backup with a clock attached. The same online/offline choice applies on every firing, and the status timestamps are what monitoring should watch.',
+          usedIn: ['cnpg-scheduled-snapshots'],
+          examples: [
+            {
+              run: `cat /root/scheduled-online.yaml
+kubectl apply -f /root/scheduled-online.yaml
+kubectl get scheduledbackup
+kubectl get backup`,
+              out: `apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: every-minute-online
+  namespace: default
+spec:
+  schedule: "0 * * * * *"
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: pg-cluster
+  method: volumeSnapshot
+  online: true
+scheduledbackup.postgresql.cnpg.io/every-minute-online created
+NAME                  AGE   CLUSTER      LAST BACKUP
+every-minute-online   25s   pg-cluster   25s
+NAME                                 AGE   CLUSTER      METHOD           PHASE       ERROR
+every-minute-online-20260817015843   25s   pg-cluster   volumeSnapshot   completed`,
+              note: '`immediate: true` fired it at creation; the Backup is named after the schedule with a timestamp appended.',
+            },
+            {
+              run: `kubectl get scheduledbackup every-minute-online -o jsonpath='{.status}{"\\n"}'`,
+              out: '{"lastCheckTime":"2026-08-17T01:58:43Z","lastScheduleTime":"2026-08-17T01:58:43Z","nextScheduleTime":"2026-08-17T01:59:00Z"}',
+              note: 'A schedule whose `lastScheduleTime` has stopped moving is a backup that has stopped happening, and nothing else in the cluster will say so.',
+            },
+            {
+              run: `kubectl get backup -o custom-columns=NAME:.metadata.name,ONLINE:.spec.online,PHASE:.status.phase
+for s in $(kubectl get volumesnapshot -o jsonpath='{.items[*].metadata.name}'); do
+  printf "%-40s " "$s"
+  kubectl get volumesnapshot $s -o jsonpath='{.metadata.annotations.cnpg\\.io/pgControldata}' | grep "Database cluster state"
+done`,
+              out: `NAME                                    ONLINE   PHASE
+every-minute-online-20260817015843      true     completed
+every-minute-online-20260817015900      true     completed
+every-minute-online-20260817020000      true     completed
+every-two-minutes-cold-20260817020000   false    completed
+every-minute-online-20260817015843       Database cluster state:               in production
+every-minute-online-20260817015900       Database cluster state:               in production
+every-minute-online-20260817020000       Database cluster state:               in production
+every-two-minutes-cold-20260817020000    Database cluster state:               shut down`,
+              note: 'Each run records the state of the database inside the snapshot it takes, so the mode a schedule uses is verifiable after the fact.',
+            },
+            {
+              run: `kubectl patch scheduledbackup every-minute-online --type=merge -p '{"spec":{"suspend":true}}'
+kubectl get scheduledbackup -o custom-columns=NAME:.metadata.name,SUSPEND:.spec.suspend,LAST:.status.lastScheduleTime,NEXT:.status.nextScheduleTime`,
+              out: `scheduledbackup.postgresql.cnpg.io/every-minute-online patched
+NAME                     SUSPEND   LAST                   NEXT
+every-minute-online      true      2026-08-17T02:02:00Z   2026-08-17T02:03:00Z
+every-two-minutes-cold   true      2026-08-17T02:02:00Z   2026-08-17T02:04:00Z`,
+              note: '`suspend` stops the clock without deleting the schedule or anything it has made — the right tool during an incident or a migration.',
+            },
+          ],
+          notes: [
+            'The schedule has six fields, seconds first: `"0 * * * * *"` is second zero of every minute.',
+            'An `online: false` schedule fences the target instance on every single run. On a single-instance cluster that is a small outage of the database, repeated on a timer, with nobody asked again.',
+            'The cold schedule in this lab had no `immediate`, so nothing happened until the clock reached second zero of an even minute.',
+            'Schedules contend. With one firing every minute and another every second minute, both at second zero, an online run that lands while the cold one has the instance fenced fails: `while ensuring target pod is healthy: no status found for target pod pg-cluster-1 in cluster pg-cluster`. Stagger the seconds.',
+          ],
+        },
+        {
+          id: 'snapshot-owner-reference',
+          name: 'spec.backup.volumeSnapshot.snapshotOwnerReference',
+          summary:
+            'Decides whether deleting a Backup takes its VolumeSnapshot with it. It defaults to none, which means nothing owns the snapshots and nothing removes them.',
+          usedIn: ['cnpg-scheduled-snapshots'],
+          examples: [
+            {
+              run: `kubectl get cluster pg-cluster -o jsonpath='{.spec.backup.volumeSnapshot.snapshotOwnerReference}{"\\n"}'
+VICTIM=$(kubectl get backup --no-headers | grep every-minute-online | head -1 | awk '{print $1}')
+kubectl get volumesnapshot $VICTIM -o jsonpath='{range .metadata.ownerReferences[*]}{.kind}/{.name}{"\\n"}{end}'; echo "(no owner if blank)"
+kubectl delete backup $VICTIM
+kubectl get volumesnapshot | grep $VICTIM`,
+              out: `none
+(no owner if blank)
+backup.postgresql.cnpg.io "every-minute-online-20260817015843" deleted from default namespace
+every-minute-online-20260817015843   true    pg-cluster-1   1Gi   csi-hostpath-snapclass   snapcontent-c9bf0967-9793-4e3e-a766-b5dc79bb5c7b   36s   36s`,
+              note: 'The Backup is gone and its snapshot is still there, with no owner and now nothing pointing at it. Columns elided from the snapshot listing.',
+            },
+            {
+              run: `kubectl patch cluster pg-cluster --type=merge \\
+  -p '{"spec":{"backup":{"volumeSnapshot":{"snapshotOwnerReference":"backup"}}}}'
+kubectl apply -f /tmp/owned-backup.yaml
+kubectl get volumesnapshot owned-backup -o jsonpath='{range .metadata.ownerReferences[*]}{.kind}/{.name}{"\\n"}{end}'
+kubectl delete backup owned-backup
+kubectl get volumesnapshot --no-headers | grep -c owned-backup`,
+              out: `cluster.postgresql.cnpg.io/pg-cluster patched
+backup.postgresql.cnpg.io/owned-backup created
+Backup/owned-backup
+backup.postgresql.cnpg.io "owned-backup" deleted from default namespace
+0`,
+              note: 'With the field set to `backup`, the next snapshot carries an ownerReference and disappears with its Backup through ordinary Kubernetes garbage collection.',
+            },
+          ],
+          notes: [
+            'The setting applies to snapshots taken *after* it is changed. Snapshots already on disk keep whatever ownership they were created with.',
+            'Nothing prunes VolumeSnapshots. Retention policies belong to Barman and apply to what Barman writes to an object store; a snapshot is a Kubernetes object created by the CSI driver, and CloudNativePG does not delete them.',
+            'The third value is `cluster`, which ties a snapshot’s life to the Cluster rather than to its Backup.',
+          ],
+        },
+        {
+          id: 'tablespace-recovery',
+          name: 'Recovering a cluster that has tablespaces (object storage)',
+          summary:
+            'The backup contains the tablespaces; the recovery manifest has to declare them, or the restore job has nowhere to unpack them and retries forever.',
+          usedIn: ['cnpg-tablespace-backup'],
+          examples: [
+            {
+              run: `kubectl get backup first-backup -o jsonpath='{.status.beginWal}{"\\n"}'
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT pg_walfile_name(pg_current_wal_lsn());"
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c "SELECT pg_switch_wal();"
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -tAc "SELECT pg_walfile_name(pg_current_wal_lsn());"`,
+              out: `000000010000000000000008
+000000010000000000000008
+ pg_switch_wal
+---------------
+ 0/8000EF8
+(1 row)
+
+000000010000000000000009`,
+              note: 'Before the switch the primary was still writing the segment the backup begins in, so the archive did not have it. Recovery needs that whole segment.',
+            },
+            {
+              run: `kubectl apply -f /root/restore-without-tablespaces.yaml
+kubectl get cluster pg-forgot --no-headers
+kubectl get pods | grep forgot`,
+              out: `cluster.postgresql.cnpg.io/pg-forgot created
+pg-forgot   80s   1     Setting up primary
+pg-forgot-1-full-recovery-6wzm6   0/2   Init:1/2   0   1s
+pg-forgot-1-full-recovery-8v4l9   0/2   Error      0   45s
+pg-forgot-1-full-recovery-kgbrd   0/2   Error      0   69s`,
+              note: 'Stuck at Setting up primary indefinitely, with Job Pods failing and being replaced. The Cluster’s own status never says why.',
+            },
+            {
+              run: `P=$(kubectl get pods --no-headers | grep "forgot.*full-recovery" | grep Error | head -1 | awk '{print $1}')
+kubectl logs $P --all-containers 2>&1 | grep -i tablespace | tail -1`,
+              out: `{"level":"info","logger":"barman-cloud-restore","msg":"ERROR: Barman cloud restore exception: [Errno 30] Read-only file system: '/var/lib/postgresql/tablespaces'","pipe":"stderr","logging_pod":"pg-forgot-1-full-recovery"}`,
+              note: 'The path exists in the image but has no volume mounted over it, on a container whose root filesystem is read-only. Timestamps elided.',
+            },
+            {
+              run: `diff /root/restore-without-tablespaces.yaml /root/restore-with-tablespaces.yaml
+kubectl apply -f /root/restore-with-tablespaces.yaml
+kubectl get cluster pg-restored --no-headers
+kubectl get pvc | grep restored
+kubectl exec pg-restored-1 -c postgres -- psql -U postgres -d app -c "SELECT count(*) FROM quarterly;"`,
+              out: `cluster.postgresql.cnpg.io/pg-restored created
+pg-restored   40s   1   1   Cluster in healthy state   pg-restored-1
+pg-restored-1                 Bound   1Gi   RWO   local-path   98s
+pg-restored-1-tbs-reporting   Bound   1Gi   RWO   local-path   98s
+ count
+-------
+   500
+(1 row)`,
+              note: 'One tablespaces block is the whole difference. The recovered cluster is a single instance recovering a three-instance backup, so it needs one volume per tablespace. diff output and PVC columns elided.',
+            },
+          ],
+          notes: [
+            'The tablespace *names* in the recovery manifest must match the backup; the size, storage class and instance count are yours to choose.',
+            'Nothing checks the match until the restore job opens the backup — there is no admission-time validation for it.',
+            'A plugin backup targets a standby by default: `status.instanceID.podName` named pg-cluster-2 and the backup label read `BACKUP FROM: standby`.',
+          ],
+        },
+        {
+          id: 'tablespace-snapshot-recovery',
+          name: 'volumeSnapshots.tablespaceStorage (snapshot recovery with tablespaces)',
+          summary:
+            'A snapshot backup of a cluster with tablespaces is one snapshot per volume, and recovery is a map from tablespace name to snapshot that you write by hand.',
+          usedIn: ['cnpg-tablespace-snapshot'],
+          examples: [
+            {
+              run: `kubectl apply -f /root/snapshot-backup.yaml
+kubectl get volumesnapshot -o custom-columns=NAME:.metadata.name,READY:.status.readyToUse,SOURCE:.spec.source.persistentVolumeClaimName,TABLESPACE:'.metadata.labels.cnpg\\.io/tablespaceName'`,
+              out: `backup.postgresql.cnpg.io/daily-snapshot created
+NAME                           READY   SOURCE                       TABLESPACE
+daily-snapshot                 true    pg-cluster-1                 <none>
+daily-snapshot-tbs-reporting   true    pg-cluster-1-tbs-reporting   reporting`,
+              note: 'Two volumes, two snapshots. The data volume takes the Backup’s name; each tablespace gets `-tbs-<tablespace>` appended and a label naming it.',
+            },
+            {
+              run: `sed "s/DATA_SNAPSHOT/daily-snapshot/" /root/restore-half.yaml.template > /root/restore-half.yaml
+kubectl apply -f /root/restore-half.yaml
+kubectl get cluster pg-half --no-headers
+kubectl get pvc | grep half
+kubectl get pods | grep half`,
+              out: `cluster.postgresql.cnpg.io/pg-half created
+pg-half   71s   1
+pg-half-1   Pending   csi-hostpath-sc   69s`,
+              note: 'With the tablespace unmapped: an empty phase, one Pending claim, no tablespace claim, and no Pod at all. `kubectl get pods` printed nothing.',
+            },
+            {
+              run: `kubectl -n cnpg-system logs deploy/cnpg-controller-manager --since=5m | grep -o "cannot create primary instance PVCs: [^\\"]*" | tail -1`,
+              out: 'cannot create primary instance PVCs: missing StorageSource for tablespace reporting PVC',
+              note: 'The only place the reason exists. kubectl describe shows nothing, the events are about ServiceAccounts, and the conditions claim the cluster has been bootstrapped.',
+            },
+            {
+              run: `sed -e "s/DATA_SNAPSHOT/daily-snapshot/" -e "s/REPORTING_SNAPSHOT/daily-snapshot-tbs-reporting/" /root/restore.yaml.template > /root/restore.yaml
+kubectl apply -f /root/restore.yaml
+kubectl get cluster pg-restored --no-headers
+kubectl get pvc pg-restored-1 -o jsonpath='{.spec.dataSource}{"\\n"}'
+kubectl get pvc pg-restored-1-tbs-reporting -o jsonpath='{.spec.dataSource}{"\\n"}'`,
+              out: `cluster.postgresql.cnpg.io/pg-restored created
+pg-restored   36s   1   1   Cluster in healthy state   pg-restored-1
+{"apiGroup":"snapshot.storage.k8s.io","kind":"VolumeSnapshot","name":"daily-snapshot"}
+{"apiGroup":"snapshot.storage.k8s.io","kind":"VolumeSnapshot","name":"daily-snapshot-tbs-reporting"}`,
+              note: 'Each claim records the snapshot it was built from — the artefact that proves the mapping was what you meant.',
+            },
+          ],
+          notes: [
+            'Do not put `-tbs-` in the name of a cluster that has tablespaces. A tablespace claim is `<instance>-tbs-<tablespace>`, and a cluster called pg-tbs-restored had its own data claim read as a tablespace’s: the data restored correctly, both claims bound, and the instance then rolled every twenty seconds forever with "original and target PodSpec differ in volumes: element tbs-pgdata has been removed". Renaming the cluster was the whole fix.',
+            'Both the data volume and the tablespace volumes have to be on a snapshot-capable StorageClass, or the backup has a hole in it.',
+            'An online snapshot restored cleanly here with no WAL archive configured — the tablespace mapping, not the backup mode, is what this recovery turns on.',
+          ],
+        },
       ],
     },
 
@@ -2336,6 +3977,57 @@ pg-cluster-3   1/1     Running   0          67s`,
           ],
           notes: [
             'Read the running image from the Deployment rather than assuming it from the manifest that was applied.',
+          ],
+        },
+        {
+          id: 'in-place-instance-manager',
+          name: 'ENABLE_INSTANCE_MANAGER_INPLACE_UPDATES',
+          summary:
+            'A binary from the operator image — the instance manager — runs as PID 1 in every postgres container. This setting lets the operator replace it inside a running Pod instead of replacing the Pod.',
+          usedIn: ['cnpg-in-place-upgrade'],
+          examples: [
+            {
+              run: `kubectl get pod pg-cluster-1 -o jsonpath='{.spec.containers[0].command}{"\\n"}'
+kubectl exec pg-cluster-1 -c postgres -- ps -o pid,args -p 1
+kubectl get pods -l cnpg.io/cluster=pg-cluster \\
+  -o custom-columns=NAME:.metadata.name,VERSION:.metadata.annotations.cnpg\\.io/operatorVersion,CREATED:.metadata.creationTimestamp,RESTARTS:.status.containerStatuses[0].restartCount`,
+              out: `["/controller/manager","instance","run","--status-port-tls","--log-level=info"]
+    PID COMMAND
+      1 /controller/manager instance run --status-port-tls --log-level=info
+NAME           VERSION   CREATED                RESTARTS
+pg-cluster-1   1.29.2    2026-08-16T18:07:18Z   0
+pg-cluster-2   1.29.2    2026-08-16T18:07:58Z   0
+pg-cluster-3   1.29.2    2026-08-16T18:08:38Z   0`,
+              note: 'PostgreSQL is a child of the instance manager, not the other way round. `cnpg.io/operatorVersion` is which version of the operator is running inside that Pod — a second version number beside the controller\'s.',
+            },
+            {
+              run: `kubectl -n cnpg-system create configmap cnpg-controller-manager-config \\
+  --from-literal=ENABLE_INSTANCE_MANAGER_INPLACE_UPDATES=true
+kubectl -n cnpg-system rollout restart deploy cnpg-controller-manager
+kubectl -n cnpg-system logs deploy/cnpg-controller-manager | grep "Operator configuration loaded" | tail -1`,
+              out: `configmap/cnpg-controller-manager-config created
+deployment.apps/cnpg-controller-manager restarted
+{"level":"info","ts":"2026-08-16T17:21:54.515629546Z","logger":"setup","msg":"Operator configuration loaded","configuration":{"webhookCertDir":"","metricsCertDir":"","pluginSocketDir":"/plugins","watchNamespace":"","operatorNamespace":"cnpg-system","operatorPullSecretName":"cnpg-pull-secret","operatorImageName":"ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0","postgresImageName":"ghcr.io/cloudnative-pg/postgresql:18.4-system-trixie","pgbouncerImageName":"ghcr.io/cloudnative-pg/pgbouncer:1.25.1","inheritedAnnotations":null,"inheritedLabels":null,"monitoringQueriesConfigmap":"cnpg-default-monitoring","monitoringQueriesSecret":"","enableInstanceManagerInplaceUpdates":true,"certificateDuration":90,"expiringCheckThreshold":7,"createAnyService":false,"clustersRolloutDelay":0,"instancesRolloutDelay":0,"includePlugins":"","standbyTcpUserTimeout":null,"kubernetesClusterDomain":"cluster.local","enableWebhookNamespaceSuffix":false,"drainTaints":["node.kubernetes.io/unschedulable","ToBeDeletedByClusterAutoscaler","karpenter.sh/disrupted","karpenter.sh/disruption"],"manageWebhookConfigurations":true}}`,
+              note: 'The whole loaded configuration is logged at startup, which is the only reliable way to confirm the setting took: `enableInstanceManagerInplaceUpdates` must read true. The key is INPLACE, one word — spelling it IN_PLACE is silently ignored and this line reads false.',
+            },
+            {
+              run: `kubectl apply --server-side -f /root/cloudnative-pg/releases/cnpg-1.30.0.yaml
+kubectl -n cnpg-system rollout status deploy cnpg-controller-manager
+kubectl get pods -l cnpg.io/cluster=pg-cluster -o custom-columns=NAME:.metadata.name,VERSION:.metadata.annotations.cnpg\\.io/operatorVersion,CREATED:.metadata.creationTimestamp,RESTARTS:.status.containerStatuses[0].restartCount
+kubectl exec psql-client -- psql -h pg-cluster-rw -tAc "SELECT now() - pg_postmaster_start_time() AS uptime;"`,
+              out: `deployment "cnpg-controller-manager" successfully rolled out
+NAME           VERSION   CREATED                RESTARTS
+pg-cluster-1   1.30.0    2026-08-16T18:07:18Z   0
+pg-cluster-2   1.30.0    2026-08-16T18:07:58Z   0
+pg-cluster-3   1.30.0    2026-08-16T18:08:38Z   0
+00:04:00.320662`,
+              note: 'The apply\'s own output is elided. The version moves within about ten seconds while every creation timestamp stays where it was and PostgreSQL\'s uptime spans the upgrade — the binary was replaced inside containers that were never restarted.',
+            },
+          ],
+          notes: [
+            'Without this setting the instance manager can only be changed by replacing the Pod, so an operator upgrade rolls every instance of every cluster it manages.',
+            'The operator reads its ConfigMap only at startup, so the setting does nothing until the operator has been restarted — and an unrecognised key in that ConfigMap produces no error, no warning and no event.',
+            'The trade is real: an in-place update swaps a running agent\'s binary underneath itself. That is why the conservative behaviour is the default and this is opt-in.',
           ],
         },
         {
@@ -2592,6 +4284,76 @@ FATAL:  database files are incompatible with server`,
           notes: [
             '`conv=notrunc` keeps the file its original size — the damage is to the contents, which is what corruption looks like in practice.',
             'Fence the instance first, or a clean shutdown will rewrite the file and undo it.',
+          ],
+        },
+        {
+          id: 'data-page-corruption',
+          name: 'pg_checksums --check + pg_stat_database.checksum_failures',
+          summary:
+            'Finding damage inside a table rather than in the files that stop a server from starting. A bad page is refused at read time, counted in the statistics, and invisible to everything else in the stack.',
+          usedIn: ['cnpg-data-corruption'],
+          examples: [
+            {
+              run: `kubectl exec $PRIMARY -c postgres -- psql -U postgres -c \\
+  "SELECT name, setting FROM pg_settings WHERE name IN ('data_checksums','ignore_checksum_failure');"
+kubectl exec $PRIMARY -c postgres -- psql -U postgres -d app -tAc "SELECT pg_relation_filepath('ledger');"`,
+              out: `          name           | setting
+-------------------------+---------
+ data_checksums          | on
+ ignore_checksum_failure | off
+(2 rows)
+
+base/16385/16390`,
+              note: '`data_checksums` is decided at initdb and cannot be changed on a running database. `pg_relation_filepath` must be run inside the database holding the table, and returns a path relative to the data directory.',
+            },
+            {
+              run: `# with the instance stopped (kubectl cnpg fencing on), after 256 bytes were overwritten in page 3
+kubectl exec pg-cluster-1 -c postgres -- pg_checksums --check -D /var/lib/postgresql/data/pgdata`,
+              out: `pg_checksums: error: checksum verification failed in file "/var/lib/postgresql/data/pgdata/base/16385/16390", block 3: calculated checksum C058 but block contains BDD5
+Checksum operation completed
+Files scanned:   1254
+Blocks scanned:  3943
+Bad checksums:  1
+Data checksum version: 1`,
+              note: 'The only tool here that goes looking for damage rather than waiting to trip over it. It refuses to run against a live server, so the instance has to be stopped — fencing does that without destroying the Pod.',
+            },
+            {
+              run: `kubectl get cluster pg-cluster
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -d app -c "SELECT count(*) FROM ledger;"
+kubectl exec pg-cluster-1 -c postgres -- psql -U postgres -c \\
+  "SELECT datname, checksum_failures, checksum_last_failure FROM pg_stat_database WHERE datname='app';"
+for i in 1 2 3; do kubectl exec pg-cluster-$i -c postgres -- psql -U postgres -d app -tAc "SELECT count(*) FROM ledger;" 2>&1 | head -1; done`,
+              out: `NAME         AGE    INSTANCES   READY   STATUS                     PRIMARY
+pg-cluster   4m4s   3           3       Cluster in healthy state   pg-cluster-1
+ERROR:  invalid page in block 3 of relation "base/16385/16390"
+ datname | checksum_failures |     checksum_last_failure
+---------+-------------------+-------------------------------
+ app     |                 2 | 2026-08-16 20:05:51.395672+00
+ERROR:  invalid page in block 3 of relation "base/16385/16390"
+2000
+2000`,
+              note: 'Everything says healthy and one query is an error. The counter is a count of failed *reads*, not of broken pages — it starts at zero after a restart and moves when something touches the block. The other two instances are fine: replication ships WAL records, not pages.',
+            },
+            {
+              run: `kubectl cnpg promote pg-cluster pg-cluster-3
+kubectl cnpg destroy pg-cluster 1
+kubectl get pvc
+kubectl delete pod pg-cluster-1 --wait=false
+kubectl get pvc`,
+              out: `Node pg-cluster-3 in cluster pg-cluster will be promoted
+Instance pg-cluster-1 of cluster pg-cluster is destroyed
+NAME           STATUS        VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+pg-cluster-1   Terminating   pvc-12e9382b-1fc7-470e-ad48-bcd8745673fa   1Gi        RWO            local-path     4m49s
+pod "pg-cluster-1" deleted from default namespace
+NAME           STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+pg-cluster-1   Bound    pvc-45818290-afb4-45a9-9e3e-62f17bfcd3d6   1Gi        RWO            local-path     58s`,
+              note: 'Move the writes first, then discard the storage. `destroy` takes the instance *number*. The claim usually sits Terminating because the operator has already recreated the Pod that mounts it — deleting that Pod once lets the deletion finish, and the instance comes back on a new volume, re-cloned from a good copy.',
+            },
+          ],
+          notes: [
+            'Nothing scans your data on its own. Alerting on `checksum_failures` catches the damage the moment a query trips over it; a periodic `pg_checksums --check` against a stopped copy is what catches it before one does.',
+            'A page corrupted on one instance is not replicated, which is the whole reason a replica can save you here. A statement that deletes the wrong rows *is* replicated, within milliseconds — that one needs a backup and a point in time.',
+            '`ignore_checksum_failure = on` turns the error into a warning and hands back whatever the block contains; `zero_damaged_pages = on` reads past the page and loses the rows in it. Both are last resorts for when the damaged copy is the only copy.',
           ],
         },
         {

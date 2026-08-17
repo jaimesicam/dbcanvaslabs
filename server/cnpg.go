@@ -36,7 +36,12 @@ const (
 	// this and has the learner move it to the pinned image, so the upgrade is real rather
 	// than a no-op re-apply.
 	cnpgPreviousPostgresImage = "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie"
-	cnpgOperatorImage = "ghcr.io/cloudnative-pg/cloudnative-pg:" + cnpgVersion
+	// One *major* release behind. The major-upgrade lab starts its cluster on PostgreSQL 17 and
+	// has the learner move it to the pinned 18 image, which is a pg_upgrade rather than a
+	// rolling restart. Pinned to the major tag rather than a patch release for the same reason
+	// as above — the lab grades what the server reports, and 17.11 is what this tag resolved to.
+	cnpgMajorPreviousPostgresImage = "ghcr.io/cloudnative-pg/postgresql:17-system-trixie"
+	cnpgOperatorImage              = "ghcr.io/cloudnative-pg/cloudnative-pg:" + cnpgVersion
 
 	// The `cnpg` kubectl plugin, shipped as its own asset on the same tagged release as the
 	// operator. Installed only for the labs whose subject *is* a plugin command (issuing a
@@ -214,6 +219,53 @@ func (c *CNPG) ApplyClusterImage(ctx context.Context, serverID, name string, ins
 	// CNPG bootstraps instances one at a time — initdb on the primary, then a join job per
 	// replica — so this is inherently serial even with the images already on every node.
 	logf("waiting for the 3-instance cluster to report healthy (CNPG bootstraps one instance at a time)")
+	deadline := time.Now().Add(10 * time.Minute)
+	for time.Now().Before(deadline) {
+		res, err := c.k3d.Kubectl(ctx, serverID, "get", "cluster.postgresql.cnpg.io", name, "-o", "jsonpath={.status.phase}")
+		if err == nil && res.ExitCode == 0 && strings.TrimSpace(res.Stdout) == "Cluster in healthy state" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return fmt.Errorf("timed out waiting for cluster %s to become healthy", name)
+}
+
+// ApplyClusterOnNode applies a Cluster pinned to one node and waits for it to be healthy.
+// Only the single-instance drain lab uses it: that lab drains the node its instance is on, and
+// on the control-plane node a drain would also evict CoreDNS and the storage provisioner.
+func (c *CNPG) ApplyClusterOnNode(ctx context.Context, serverID, name string, instances int, storageSize, nodeName string, logf func(string)) error {
+	manifest := fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %s
+  namespace: default
+spec:
+  instances: %d
+  imageName: %s
+  affinity:
+    nodeSelector:
+      kubernetes.io/hostname: %s
+  storage:
+    size: %s
+`, name, instances, cnpgPostgresImage, nodeName, storageSize)
+	if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", "cluster.yaml", []byte(manifest), 0644); err != nil {
+		return err
+	}
+
+	logf(fmt.Sprintf("kubectl apply -f cluster.yaml (%d instance on %s)", instances, nodeName))
+	res, err := c.k3d.Kubectl(ctx, serverID, "apply", "-f", "/root/cluster.yaml")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("kubectl apply cluster: exit %d: %s", res.ExitCode, res.Stderr)
+	}
+
+	logf("waiting for the cluster to report healthy")
 	deadline := time.Now().Add(10 * time.Minute)
 	for time.Now().Before(deadline) {
 		res, err := c.k3d.Kubectl(ctx, serverID, "get", "cluster.postgresql.cnpg.io", name, "-o", "jsonpath={.status.phase}")
@@ -550,6 +602,229 @@ spec:
 	return c.k3d.docker.PutArchive(ctx, serverID, "/root", "initdb-cluster.yaml", []byte(manifest), 0644)
 }
 
+/* ------------------------------------------------- seeded data and second servers */
+
+// primaryOf returns the instance currently acting as primary, which is the only instance a
+// seeding step may write to.
+func (c *CNPG) primaryOf(ctx context.Context, serverID, cluster string) (string, error) {
+	res, err := c.k3d.Kubectl(ctx, serverID, "get", "cluster.postgresql.cnpg.io", cluster, "-o", "jsonpath={.status.currentPrimary}")
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode != 0 || strings.TrimSpace(res.Stdout) == "" {
+		return "", fmt.Errorf("reading current primary of %s: exit %d: %s", cluster, res.ExitCode, res.Stderr)
+	}
+	return strings.TrimSpace(res.Stdout), nil
+}
+
+// psqlSeed runs one statement inside the primary as the local postgres superuser, over the
+// unix socket. Everything a recipe seeds goes through here — the generated pg_hba only admits
+// `local all all peer`, so the OS user inside the container (postgres) is the only role that
+// can connect without a password, and any other owner is arranged with ALTER ... OWNER TO.
+func (c *CNPG) psqlSeed(ctx context.Context, serverID, pod, db, sql string) error {
+	res, err := c.k3d.docker.ExecRoot(ctx, serverID, []string{
+		"kubectl", "exec", pod, "-c", "postgres", "--",
+		"psql", "-U", "postgres", "-d", db, "-v", "ON_ERROR_STOP=1", "-c", sql,
+	}, []string{"KUBECONFIG=" + k3dKubeconfig})
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("seeding %s: %s", db, firstLine(res.Stderr))
+	}
+	return nil
+}
+
+// SeedAppTable creates a table in the application database, owned by the application user,
+// fills it, reads it once and checkpoints.
+//
+// The read and the checkpoint are not decoration. With data checksums on, the first read of a
+// freshly written page sets hint bits, which dirties the page and writes a full-page image to
+// the WAL — so a page damaged afterwards would be silently repaired on the standbys by replay.
+// Doing the first read here, before the learner touches anything, is what makes the corruption
+// lab's damage stay damaged.
+func (c *CNPG) SeedAppTable(ctx context.Context, serverID, cluster, table string, rows int, logf func(string)) error {
+	primary, err := c.primaryOf(ctx, serverID, cluster)
+	if err != nil {
+		return err
+	}
+	logf(fmt.Sprintf("seeding %s with %d rows in the app database", table, rows))
+	stmts := []string{
+		fmt.Sprintf("CREATE TABLE %s (id serial primary key, entry text)", table),
+		// Owned by the application user, so the lab's own client Pod can read it.
+		fmt.Sprintf("ALTER TABLE %s OWNER TO app", table),
+		fmt.Sprintf("ALTER SEQUENCE %s_id_seq OWNER TO app", table),
+		fmt.Sprintf("INSERT INTO %s (entry) SELECT 'entry-'||g FROM generate_series(1,%d) g", table, rows),
+		fmt.Sprintf("SELECT count(*) FROM %s", table),
+		"CHECKPOINT",
+	}
+	for _, sql := range stmts {
+		if err := c.psqlSeed(ctx, serverID, primary, "app", sql); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SeedSourceServer turns the lab's cluster into the kind of server somebody actually wants to
+// migrate off: several application databases with their own owner, a role that cannot log in,
+// and data in each. It also switches superuser access on, because a logical import connects as
+// a real PostgreSQL user over the network and only the superuser may read every database and
+// dump the roles.
+func (c *CNPG) SeedSourceServer(ctx context.Context, serverID, cluster string, logf func(string)) error {
+	primary, err := c.primaryOf(ctx, serverID, cluster)
+	if err != nil {
+		return err
+	}
+
+	logf("creating the roles and databases this server will be migrated from")
+	// Roles and databases as the superuser; the objects inside each database as their owner,
+	// so ownership means something when it is (or is not) carried across by an import.
+	for _, sql := range []string{
+		"CREATE ROLE shop LOGIN PASSWORD 'shop_pw'",
+		"CREATE ROLE reporting NOLOGIN",
+		"CREATE DATABASE orders OWNER shop",
+		"CREATE DATABASE billing OWNER shop",
+	} {
+		if err := c.psqlSeed(ctx, serverID, primary, "postgres", sql); err != nil {
+			return err
+		}
+	}
+	for _, seed := range []struct {
+		db    string
+		stmts []string
+	}{
+		{"orders", []string{
+			"CREATE TABLE lines (id serial primary key, sku text, qty int)",
+			"INSERT INTO lines (sku, qty) SELECT 'sku-'||g, g FROM generate_series(1,500) g",
+			"ALTER TABLE lines OWNER TO shop",
+			"ALTER SEQUENCE lines_id_seq OWNER TO shop",
+			"GRANT SELECT ON lines TO reporting",
+		}},
+		{"billing", []string{
+			"CREATE TABLE invoices (id serial primary key, total numeric)",
+			"INSERT INTO invoices (total) SELECT g*1.5 FROM generate_series(1,200) g",
+			"ALTER TABLE invoices OWNER TO shop",
+			"ALTER SEQUENCE invoices_id_seq OWNER TO shop",
+		}},
+	} {
+		for _, sql := range seed.stmts {
+			if err := c.psqlSeed(ctx, serverID, primary, seed.db, sql); err != nil {
+				return err
+			}
+		}
+	}
+
+	logf("switching on superuser access, so an import can connect as postgres")
+	if res, err := c.k3d.Kubectl(ctx, serverID, "patch", "cluster.postgresql.cnpg.io", cluster,
+		"--type=merge", "-p", `{"spec":{"enableSuperuserAccess":true}}`); err != nil {
+		return err
+	} else if res.ExitCode != 0 {
+		return fmt.Errorf("enable superuser access: exit %d: %s", res.ExitCode, res.Stderr)
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		res, err := c.k3d.Kubectl(ctx, serverID, "get", "secret", cluster+"-superuser", "-o", "jsonpath={.metadata.name}")
+		if err == nil && res.ExitCode == 0 && strings.TrimSpace(res.Stdout) != "" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+	return fmt.Errorf("timed out waiting for the %s-superuser secret", cluster)
+}
+
+// StageCloneManifest writes — but does not apply — a Cluster that clones the source with
+// pg_basebackup and then stands on its own.
+//
+// The only difference from a streaming replica cluster is what is *missing*: there is no
+// `replica` stanza, so nothing keeps the copy in recovery. It finishes the base backup, starts
+// as its own primary and diverges from that instant. The externalClusters entry is identical,
+// because the copy is taken over the streaming replication protocol either way.
+func (c *CNPG) StageCloneManifest(ctx context.Context, serverID, source, clone string, logf func(string)) error {
+	manifest := fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %s
+  namespace: default
+spec:
+  instances: 1
+  imageName: %s
+  storage:
+    size: 1Gi
+  bootstrap:
+    pg_basebackup:
+      source: origin
+`+streamingExternalCluster, clone, cnpgPostgresImage, source, source, source, source)
+
+	logf("staging the clone manifest on the server node")
+	return c.k3d.docker.PutArchive(ctx, serverID, "/root", "clone.yaml", []byte(manifest), 0644)
+}
+
+// StageImportManifest writes the Cluster that imports from the source with pg_dump and
+// pg_restore. The two import types produce very different results from nearly identical YAML,
+// which is the whole point of the pair of labs that use this:
+//
+//	microservice — exactly one database, restored into the *new* cluster's application
+//	  database and reassigned to its application user. Roles are not imported.
+//	monolith — any number of databases, keeping their names and owners, plus the roles they
+//	  belong to. No application database, user or Secret is created at all.
+//
+// Both connect as postgres, because the source's application user can neither read another
+// owner's database nor dump roles.
+func (c *CNPG) StageImportManifest(ctx context.Context, serverID, source, target, kind string, logf func(string)) error {
+	var importBlock string
+	switch kind {
+	case "microservice":
+		importBlock = `        type: microservice
+        databases:
+          - orders
+`
+	case "monolith":
+		importBlock = `        type: monolith
+        databases:
+          - "*"
+        roles:
+          - "*"
+`
+	default:
+		return fmt.Errorf("unknown import type %q", kind)
+	}
+
+	manifest := fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %s
+  namespace: default
+spec:
+  instances: 1
+  imageName: %s
+  storage:
+    size: 1Gi
+  bootstrap:
+    initdb:
+      import:
+%s        source:
+          externalCluster: source-db
+  externalClusters:
+    - name: source-db
+      connectionParameters:
+        host: %s-rw
+        user: postgres
+        dbname: postgres
+        sslmode: require
+      password:
+        name: %s-superuser
+        key: password
+`, target, cnpgPostgresImage, importBlock, source, source)
+
+	logf("staging the " + kind + " import manifest on the server node")
+	return c.k3d.docker.PutArchive(ctx, serverID, "/root", "import.yaml", []byte(manifest), 0644)
+}
+
 // InstallPlugin puts the `cnpg` kubectl plugin on every node, so the labs whose subject is
 // a plugin command can run `kubectl cnpg ...` from any terminal tab. The release publishes
 // one tarball per architecture, and the nodes are whatever the host is (no `platform:` pin
@@ -653,6 +928,237 @@ func (c *CNPG) ApplyPSQLClient(ctx context.Context, serverID, clusterName string
 		return fmt.Errorf("kubectl apply psql-client: exit %d: %s", res.ExitCode, res.Stderr)
 	}
 	return c.k3d.waitPodReady(ctx, serverID, "psql-client", 3*time.Minute)
+}
+
+// DeclareManagedRole is the precondition of the password-maintenance lab: a managed role whose
+// password already lives in a Kubernetes Secret. The lab is about maintaining that password —
+// rotating it, expiring it, disabling it — so the role itself is part of the environment rather
+// than the exercise. It waits for the role to exist in the database, because "declared" and
+// "created" are two different moments and the first objective compares against the second.
+func (c *CNPG) DeclareManagedRole(ctx context.Context, serverID, clusterName, role, secretName, password string, logf func(string)) error {
+	logf("creating the Secret holding the " + role + " password")
+	res, err := c.k3d.Kubectl(ctx, serverID, "create", "secret", "generic", secretName,
+		"--from-literal=username="+role, "--from-literal=password="+password)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 && !strings.Contains(res.Stderr, "already exists") {
+		return fmt.Errorf("create %s: exit %d: %s", secretName, res.ExitCode, res.Stderr)
+	}
+
+	logf("declaring " + role + " under spec.managed.roles, with its password from that Secret")
+	patch := fmt.Sprintf(`{"spec":{"managed":{"roles":[{"name":%q,"ensure":"present","login":true,`+
+		`"comment":"reporting account","passwordSecret":{"name":%q}}]}}}`, role, secretName)
+	if res, err := c.k3d.Kubectl(ctx, serverID, "patch", "cluster.postgresql.cnpg.io", clusterName,
+		"--type=merge", "-p", patch); err != nil {
+		return err
+	} else if res.ExitCode != 0 {
+		return fmt.Errorf("declare managed role: exit %d: %s", res.ExitCode, res.Stderr)
+	}
+
+	logf("waiting for the operator to create the role")
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		primary, err := c.primaryOf(ctx, serverID, clusterName)
+		if err == nil {
+			res, err := c.k3d.docker.ExecRoot(ctx, serverID, []string{
+				"kubectl", "exec", primary, "-c", "postgres", "--",
+				"psql", "-U", "postgres", "-tAc",
+				fmt.Sprintf("SELECT count(*) FROM pg_roles WHERE rolname = '%s';", role),
+			}, []string{"KUBECONFIG=" + k3dKubeconfig})
+			if err == nil && res.ExitCode == 0 && strings.TrimSpace(res.Stdout) == "1" {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return fmt.Errorf("timed out waiting for the %s role to be created", role)
+}
+
+// tablespaceSpec is one entry of spec.tablespaces as the recipes below declare it.
+type tablespaceSpec struct {
+	Name      string
+	Size      string
+	Owner     string
+	Temporary bool
+}
+
+func tablespacesPatch(specs []tablespaceSpec) string {
+	var b strings.Builder
+	b.WriteString(`{"spec":{"tablespaces":[`)
+	for i, t := range specs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"name":%q,"storage":{"size":%q},"temporary":%t`, t.Name, t.Size, t.Temporary)
+		if t.Owner != "" {
+			fmt.Fprintf(&b, `,"owner":{"name":%q}`, t.Owner)
+		}
+		b.WriteString("}")
+	}
+	b.WriteString(`]}}`)
+	return b.String()
+}
+
+// DeclareTablespaces adds tablespaces to a running cluster and waits for every one of them to
+// report `reconciled`. Declaring a tablespace attaches a new volume to each instance, so the
+// operator rolls the cluster to do it — which is why this waits on the tablespace status rather
+// than on the cluster phase, and why the labs whose *subject* is declaring one do it themselves.
+func (c *CNPG) DeclareTablespaces(ctx context.Context, serverID, clusterName string, specs []tablespaceSpec, logf func(string)) error {
+	names := make([]string, 0, len(specs))
+	for _, t := range specs {
+		names = append(names, t.Name)
+	}
+	logf("declaring tablespaces " + strings.Join(names, ", ") + " (the operator rolls the cluster to attach the volumes)")
+	if res, err := c.k3d.Kubectl(ctx, serverID, "patch", "cluster.postgresql.cnpg.io", clusterName,
+		"--type=merge", "-p", tablespacesPatch(specs)); err != nil {
+		return err
+	} else if res.ExitCode != 0 {
+		return fmt.Errorf("declare tablespaces: exit %d: %s", res.ExitCode, res.Stderr)
+	}
+
+	logf("waiting for every tablespace to report reconciled")
+	deadline := time.Now().Add(10 * time.Minute)
+	want := strings.Repeat("reconciled ", len(specs))
+	for time.Now().Before(deadline) {
+		res, err := c.k3d.Kubectl(ctx, serverID, "get", "cluster.postgresql.cnpg.io", clusterName,
+			"-o", `jsonpath={range .status.tablespacesStatus[*]}{.state} {end}`)
+		if err == nil && res.ExitCode == 0 && res.Stdout == want {
+			// The tablespace is reconciled as soon as PostgreSQL knows about it; the roll that
+			// attached the volumes can still be finishing.
+			if p, err := c.k3d.Kubectl(ctx, serverID, "get", "cluster.postgresql.cnpg.io", clusterName,
+				"-o", "jsonpath={.status.phase}"); err == nil &&
+				strings.TrimSpace(p.Stdout) == "Cluster in healthy state" {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return fmt.Errorf("timed out waiting for tablespaces on %s", clusterName)
+}
+
+// SeedTablespaceTable puts a real table inside a tablespace, so a backup of that cluster has
+// something in the tablespace worth recovering.
+func (c *CNPG) SeedTablespaceTable(ctx context.Context, serverID, cluster, table, tablespace string, rows int, logf func(string)) error {
+	primary, err := c.primaryOf(ctx, serverID, cluster)
+	if err != nil {
+		return err
+	}
+	logf(fmt.Sprintf("seeding %s with %d rows inside the %s tablespace", table, rows, tablespace))
+	stmts := []string{
+		fmt.Sprintf("CREATE TABLE %s (id serial primary key, entry text) TABLESPACE %s", table, tablespace),
+		fmt.Sprintf("ALTER TABLE %s OWNER TO app", table),
+		fmt.Sprintf("ALTER SEQUENCE %s_id_seq OWNER TO app", table),
+		fmt.Sprintf("INSERT INTO %s (entry) SELECT 'entry-'||g FROM generate_series(1,%d) g", table, rows),
+		fmt.Sprintf("SELECT count(*) FROM %s", table),
+		"CHECKPOINT",
+	}
+	for _, sql := range stmts {
+		if err := c.psqlSeed(ctx, serverID, primary, "app", sql); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StageTablespaceRestoreManifests writes the two recovery Clusters the object-store tablespace
+// lab applies: one that forgets to declare the tablespaces and one that declares them. Both
+// recover from the same backup through the Barman Cloud plugin; the only difference between the
+// files is the `tablespaces` block, which is the whole lesson.
+func (c *CNPG) StageTablespaceRestoreManifests(ctx context.Context, serverID, sourceCluster string, specs []tablespaceSpec, logf func(string)) error {
+	recover := func(name string, withTablespaces bool) string {
+		tbs := ""
+		if withTablespaces {
+			var b strings.Builder
+			b.WriteString("  tablespaces:\n")
+			for _, t := range specs {
+				fmt.Fprintf(&b, "  - name: %s\n    storage:\n      size: %s\n", t.Name, t.Size)
+			}
+			tbs = b.String()
+		}
+		return fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %s
+  namespace: default
+spec:
+  instances: 1
+  imageName: %s
+  storage:
+    size: 1Gi
+%s  bootstrap:
+    recovery:
+      source: origin
+  externalClusters:
+  - name: origin
+    plugin:
+      name: %s
+      parameters:
+        barmanObjectName: %s
+        serverName: %s
+`, name, cnpgPostgresImage, tbs, barmanPluginName, objectStoreName, sourceCluster)
+	}
+	files := map[string]string{
+		"restore-without-tablespaces.yaml": recover("pg-forgot", false),
+		"restore-with-tablespaces.yaml":    recover("pg-restored", true),
+	}
+	logf("staging two recovery manifests: one that declares the tablespaces and one that does not")
+	for name, body := range files {
+		if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", name, []byte(body), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StageDatabaseManifests writes the Database objects the declarative-database labs apply. They
+// are staged rather than applied because declaring one is the graded action.
+func (c *CNPG) StageDatabaseManifests(ctx context.Context, serverID, clusterName, kind string, logf func(string)) error {
+	db := func(object, dbName, policy string) string {
+		reclaim := ""
+		if policy != "" {
+			reclaim = fmt.Sprintf("  databaseReclaimPolicy: %s\n", policy)
+		}
+		return fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: %s
+  namespace: default
+spec:
+  cluster:
+    name: %s
+  name: %s
+  owner: app
+%s`, object, clusterName, dbName, reclaim)
+	}
+	files := map[string]string{}
+	switch kind {
+	case "retain":
+		// No databaseReclaimPolicy at all: the lab's first objective is reading the default the
+		// webhook fills in.
+		files["reporting-db.yaml"] = db("reporting-db", "reporting", "")
+		files["reporting-dup.yaml"] = db("reporting-dup", "reporting", "")
+	case "reclaim":
+		files["temp-db.yaml"] = db("temp-db", "tempdb", "delete")
+		files["keep-db.yaml"] = db("keep-db", "keepdb", "retain")
+	default:
+		return fmt.Errorf("unknown database manifest kind %q", kind)
+	}
+	logf("staging the Database manifests this lab applies")
+	for name, body := range files {
+		if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", name, []byte(body), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // StagePoolerManifest writes (but does not apply) a Pooler manifest — the PgBouncer lab's
@@ -939,6 +1445,13 @@ spec:
 // arriving there — the precondition for the labs whose subject is *restoring*, which need a
 // working archive before the learner starts rather than as their first exercise.
 func (c *CNPG) ConfigureBarmanBackup(ctx context.Context, serverID, clusterName string, logf func(string)) error {
+	return c.ConfigureBarmanBackupInstances(ctx, serverID, clusterName, 3, logf)
+}
+
+// ConfigureBarmanBackupInstances is the same with the instance count spelled out, because the
+// wait below is for *every* instance to be ready and rolled, and the volume-snapshot labs run a
+// single-instance cluster (the CSI hostpath driver lives on one node).
+func (c *CNPG) ConfigureBarmanBackupInstances(ctx context.Context, serverID, clusterName string, instances int, logf func(string)) error {
 	logf("creating the object store credentials and ObjectStore")
 	res, err := c.k3d.Kubectl(ctx, serverID, "create", "secret", "generic", "seaweedfs-creds",
 		"--from-literal=ACCESS_KEY_ID=seaweedfs", "--from-literal=ACCESS_SECRET_KEY=seaweedfs_password")
@@ -980,7 +1493,7 @@ func (c *CNPG) ConfigureBarmanBackup(ctx context.Context, serverID, clusterName 
 	for time.Now().Before(deadline) {
 		res, err := c.k3d.Kubectl(ctx, serverID, "get", "cluster.postgresql.cnpg.io", clusterName,
 			"-o", `jsonpath={.status.readyInstances} {range .status.conditions[?(@.type=="ContinuousArchiving")]}{.status}{end}`)
-		if err == nil && res.ExitCode == 0 && strings.TrimSpace(res.Stdout) == "3 True" {
+		if err == nil && res.ExitCode == 0 && strings.TrimSpace(res.Stdout) == fmt.Sprintf("%d True", instances) {
 			rolled, err := c.instancesRolledSince(ctx, serverID, clusterName, patchedAt)
 			if err == nil && rolled {
 				return nil

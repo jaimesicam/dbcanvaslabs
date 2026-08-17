@@ -15,6 +15,10 @@ modes) — never invented shell transcripts.
 Checked labs (`[x]`) are playable end to end in this app today. Everything else is
 roadmap — browsable eventually, not yet built.
 
+**Every item on this roadmap is now built**: 71 labs, each provisioning a real cluster and
+grading real command output. New entries added below start unchecked and go through the
+same pipeline (see *Content pipeline* at the end).
+
 ## Basic
 
 - [x] Installation of the operator
@@ -228,74 +232,291 @@ roadmap — browsable eventually, not yet built.
       the instance (via `volume.kubernetes.io/selected-node`) to the very node now tainted.
       Neither fact alone would strand it. A toleration under `spec.affinity.tolerations` is
       written verbatim onto the Pod and schedules it back onto the still-tainted node.
-- [ ] Pod affinity using `NodeSelector`
-- [ ] Rolling updates on PodSpec drift detection
-- [ ] In-place upgrades
-- [ ] Multi-Arch availability
+- [x] Pod affinity using `NodeSelector` — built as *Node Selectors and Pod Anti-Affinity*. A
+      Cluster nobody has touched already reads `podAntiAffinityType: preferred`, defaulted in by
+      the webhook, and only the *Pod* carries the rule it expands into — a weighted term on
+      `kubernetes.io/hostname`. Declaring `spec.affinity.nodeSelector` rolls the cluster, and on
+      `local-path` storage the first Pod rebuilt cannot be placed at all: `1 node(s) didn't match
+      PersistentVolume's node affinity, 2 node(s) didn't match Pod's node affinity/selector`.
+      Labelling the remaining nodes fixes it without touching the database. The third objective is
+      the single-zone trap — `required` over a topology every node shares, which strands an
+      instance with `didn't match pod anti-affinity rules`.
+- [x] Rolling updates on PodSpec drift detection — the operator keeps the Pod spec it generated in
+      the `cnpg.io/podSpec` annotation and compares *that*, not the live object. A `spec.resources`
+      patch rolls all three instances in under a minute (replicas first, primary last, phase
+      "Primary instance is being restarted without a switchover", primary unchanged); overwriting
+      one Pod's annotation with junk has that Pod deleted and rebuilt within three seconds, while
+      an ordinary label of the learner's own on the same Pod is left alone forever.
+- [x] In-place upgrades — the instance manager is an operator binary running as PID 1 in every
+      postgres container, so by default an operator upgrade replaces every instance Pod.
+      `ENABLE_INSTANCE_MANAGER_INPLACE_UPDATES=true` (INPLACE, one word — the `IN_PLACE` spelling
+      is ignored in silence and the operator logs the setting still false) makes 1.29.2 → 1.30.0
+      swap the binary inside the running containers: `cnpg.io/operatorVersion` moves, creation
+      timestamps do not, restart counts stay 0 and PostgreSQL's uptime spans the upgrade.
+- [x] Multi-Arch availability — the environment is whatever the host is, so the lab reads its own
+      architecture and then asks ghcr.io what the pinned tag really contains: an index of four
+      manifests, `linux/amd64`, `linux/arm64` and two `unknown/unknown` build attestations.
+      Following the platform digest to its manifest and then to the config blob returns the
+      image's own `{"architecture":"arm64","os":"linux"}`. Grading walks the same chain
+      server-side (`server/registry.go`), which is the only way to check a digest the learner
+      typed. The Pod's `imageID` deliberately is **not** compared: these images are side-loaded
+      into the k3d nodes, so the local re-pack has a different digest.
 
 ## Cluster Metadata
 
-- [ ] ConfigMap for Cluster Labels and Annotations
-- [ ] Object metadata
+- [x] ConfigMap for Cluster Labels and Annotations — built around the per-cluster field,
+      `spec.inheritedMetadata`, which needs no operator restart: labels and annotations reach the
+      Pods, claims, Services and the generated Secret within seconds with nothing recreated. Two
+      asymmetries are the spine: changing a value rewrites it everywhere, while removing a key
+      leaves the old label on every object indefinitely (and a merge patch needs an explicit
+      `null` to remove it at all). It ends by inheriting `cnpg.io/instanceRole: primary`, which
+      overrides the operator's own routing label — three endpoints behind the read-write Service
+      and `cannot execute INSERT in a read-only transaction` on five writes out of six.
+- [x] Object metadata — one selector, `cnpg.io/cluster`, inventories everything the operator
+      generated; the per-kind role labels (`podRole`, `pvcRole`, `userType`) and the `-rw`/`-ro`/
+      `-r` Service selectors are the whole of CloudNativePG's traffic routing. Relabelling a
+      replica `primary` by hand is reverted in about a second — too fast for the EndpointSlice
+      controller to act on it — while a label of the learner's own on the same Pod survives.
 
 ## Recovery
 
-- [ ] Data corruption
-- [ ] pg_basebackup
+- [x] Data corruption — damage *inside* a table rather than in the files that stop a server
+      starting: 256 bytes overwritten in one 8KB page of a real relation. The instance stays
+      Ready, the Cluster still reports "Cluster in healthy state" 3/3, and only a query touching
+      that block fails — `ERROR: invalid page in block 3 of relation "base/16385/16390"`. The
+      spine is the gap between healthy and correct: `pg_stat_database.checksum_failures` counts
+      failed *reads* (zero until something looks, and reset by a restart), `pg_checksums --check`
+      is the only thing that goes looking, and it needs the instance stopped, which fencing does.
+      The replicas are untouched because replication ships WAL records rather than pages, so the
+      recovery is switchover first, then `kubectl cnpg destroy` — which leaves the claim
+      Terminating until the Pod the operator has already recreated is deleted.
+- [x] pg_basebackup — built as *Cloning a Cluster with pg_basebackup*: the same bootstrap block
+      as a streaming replica cluster with the `replica` stanza left out, which is the whole
+      difference. A `pg-clone-1-pgbasebackup-*` Job copies the source in ~36 seconds and the copy
+      comes up as its own primary (`pg_is_in_recovery()` is `f`, no WAL receiver, absent from the
+      source's `pg_stat_replication`). Two findings make the lab: the operator resets the
+      application user to the clone's own Secret, so the source password is refused on the copy;
+      and both clusters stay on **timeline 1**, since a clone is never promoted — after which the
+      same id means a different row on each side and their WAL must never share an archive.
 
 ## Importing Databases
 
-- [ ] Microservice approach
-- [ ] Monolith approach
+- [x] Microservice approach — `bootstrap.initdb.import` with `type: microservice` moves one
+      database off a shared server with pg_dump and pg_restore, in about 30 seconds. It arrives
+      as the new cluster's **app** database with its objects reassigned to the new **app** user,
+      so both the database name and the ownership change; no roles come with it, and a row
+      written on the source afterwards never appears (501 against 500). The connection must be
+      made as a superuser, so the recipe switches `enableSuperuserAccess` on for the source.
+- [x] Monolith approach — the same field with `type: monolith` and `"*"` for both databases and
+      roles lifts the whole server: names, owners, grants and roles kept, including a NOLOGIN
+      role and the login role's password hash, so `shop` authenticates on the copy with the
+      password it had on the original. What such a cluster does *not* have is the interesting
+      half — no application database, user or `-app` Secret, only the ca/replication/server
+      certificates, because the operator was never asked to create one.
 
 ## Storage
 
-- [ ] Storage expansion
-- [ ] Dedicated PG_WAL persistent volume
+- [x] Storage expansion — needs a class that allows it, so the lab runs on the CSI hostpath driver
+      (`server/csi.go`) with k3s's own `local-path` next to it for contrast: one says
+      `allowVolumeExpansion: true`, the other says nothing, which means false. Patching
+      `spec.storage.size` 1Gi → 2Gi moved the claim's *request* at once and its
+      `status.capacity` about a minute later, with the PVC's events recording all four
+      handoffs — ExternalExpanding → Resizing → FileSystemResizeRequired →
+      FileSystemResizeSuccessful — and the Pod never restarted, on the same volume throughout.
+      Both walls are real refusals: the operator's webhook says `can't shrink existing storage
+      from 2Gi to 1Gi`, and the API server says `only dynamically provisioned pvc can be
+      resized and the storageclass that provisions the pvc must support resize`.
+- [x] Dedicated PG_WAL persistent volume — `spec.walStorage` can be added to a *running*
+      cluster: one `<instance>-wal` claim each, a roll of about 45 seconds, and `pg_wal` inside
+      the data directory becomes a symlink to `/var/lib/postgresql/wal/pg_wal`. Two findings
+      make the lab: the WAL claims land on the **default** StorageClass unless one is named, so
+      it is easy to put the log on slower storage than the data; and the field is a one-way
+      door — `walStorage cannot be disabled once configured`.
 
 ## Maintenance
 
-- [ ] Node Drain with maintenance window
-- [ ] Node Drain with single-instance cluster with/without Pod Disruption Budgets
+- [x] Node Drain with maintenance window — the operator maintains **two** PodDisruptionBudgets,
+      one over the replicas (one disruption allowed) and one over the primary (none). Draining a
+      replica's node evicts it and then strands it, because a `local-path` volume cannot follow:
+      `1 node(s) were unschedulable, 2 node(s) didn't match PersistentVolume's node affinity`.
+      The drain also deletes the bare `psql-client` Pod for good, warning about Pods that
+      declare no controller. `spec.nodeMaintenanceWindow` with `reusePVC: false` then has the
+      operator write that copy off and rebuild the instance elsewhere in about a minute — and
+      the API server answers the patch with `Consider using .spec.enablePDB instead of the node
+      maintenance window feature`.
+- [x] Node Drain with single-instance cluster with/without Pod Disruption Budgets — one instance
+      means one budget with zero allowed disruptions, so the drain cordons the node and then
+      never finishes: `Cannot evict pod as it would violate the pod's disruption budget`, retried
+      until the timeout, with the database serving throughout. `spec.enablePDB: false` deletes
+      the budgets and the same drain completes in seconds — into the outage the budget existed
+      to prevent: the instance Pending, the read-write Service with no endpoints, and a client
+      getting `Connection refused` until the node is uncordoned.
 
 ## Hibernation
 
-- [ ] Declarative hibernation / rehydration
+- [x] Declarative hibernation / rehydration — the annotation `cnpg.io/hibernation`, applied
+      directly rather than through the plugin, so a manifest can carry it. Pods gone in about ten
+      seconds, all claims kept, and the trap worth teaching: `kubectl get cluster` still reports
+      "Cluster in healthy state" with a blank READY column, so the only honest signal is the
+      `cnpg.io/hibernation` condition (True/Hibernated) — which is *removed* rather than set to
+      False on waking. The Services survive with no endpoints, so a client gets `Connection
+      refused` rather than a name that does not resolve; the spec stays editable while it sleeps
+      (max_connections patched to 200 with no Pods running, in force on wake); and waking took
+      about 30 seconds onto volumes older than the Pods using them.
 
 ## Volume snapshots
 
-- [ ] Backup/restore for cold and online snapshots
-- [ ] Point-in-time recovery (PITR) for cold and online snapshots
-- [ ] Backups via plugin for cold and online snapshots
-- [ ] Declarative backups for cold and online snapshots
+- [x] Backup/restore for cold and online snapshots — one boolean, `spec.online`. Online (the
+      default) keeps the instance serving and stores PostgreSQL's own backup label on the
+      VolumeSnapshot as `cnpg.io/backupLabelFile`; offline fences the instance for the duration
+      — `cnpg.io/fencedInstances` names it while the backup runs — and produces a snapshot with
+      no label at all. The difference is durable and unarguable in the snapshot's recorded
+      control file: `Database cluster state: in production` against `shut down`. One caution
+      baked into the lab: `.status.online` reported true for *both* backups in 1.30, so the mode
+      has to be read from `.spec.online`. Restoring the cold one brought a cluster up healthy in
+      ~37 seconds with no recovery at all.
+- [x] Point-in-time recovery (PITR) for cold and online snapshots — the snapshot is a floor,
+      not a destination. Paired with a WAL archive through `bootstrap.recovery.source` and an
+      `externalClusters` entry, `recoveryTarget.targetTime` decides where replay stops. Measured
+      with a hot and a cold snapshot taken back to back (the second waited `pending` while the
+      first ran) and two rows written four seconds apart around a recorded moment: both recovered
+      clusters came up healthy in ~40s carrying `first` and not `second`, and each claim's
+      `spec.dataSource` named the snapshot it was built from. Hot and cold reach the same point —
+      the mode decides what happens when the copy is opened, the archive decides how far forward
+      it can go. Take the target time from `SELECT now()`, not from a node's clock.
+- [x] Backups via plugin for cold and online snapshots — `kubectl cnpg backup` builds an ordinary
+      Backup out of its flags and applies it; there is no second mechanism. With no flags it
+      leaves `spec.online` unset (the listing reads `<none>`) so the Cluster decides, and names
+      the object `<cluster>-<timestamp>`. `--online=false --backup-name cold-by-plugin` fenced the
+      instance for ~31s — `cnpg.io/fencedInstances` naming it throughout — and left a snapshot
+      whose recorded control file reads `shut down` with no backup label. `kubectl cnpg status`
+      and `status.lastSuccessfulBackupByMethod` are where the cluster's own account lives.
+- [x] Declarative backups for cold and online snapshots — a ScheduledBackup is a Backup with a
+      clock: six-field cron (seconds first), `immediate`, `suspend`, and the same `online` choice
+      applied on every firing. `status.{lastCheckTime,lastScheduleTime,nextScheduleTime}` are what
+      monitoring should watch. The lab's spine is retention, measured twice: with the default
+      `snapshotOwnerReference: none` a snapshot has no ownerReferences and outlives the Backup
+      that made it; set to `backup` the next snapshot carries `Backup/<name>` and is
+      garbage-collected with it. Nothing prunes VolumeSnapshots — Barman retention applies to
+      object storage, not to CSI snapshots. One more thing the lab records because a real run
+      produced it: two schedules both firing at second zero contend, and an online run landing
+      while the cold one has the instance fenced fails with `while ensuring target pod is
+      healthy: no status found for target pod`.
 
 ## Managed Roles
 
-- [ ] Creation and update of managed roles
-- [ ] Password maintenance using Kubernetes secrets
+- [x] Creation and update of managed roles — `spec.managed.roles` with a `passwordSecret` creates
+      the role within seconds, applies its `COMMENT ON ROLE`, and reports it under
+      `byStatus.reconciled`. Two edges shape the lab, both measured over several minutes: an
+      `ALTER ROLE analyst NOLOGIN` made outside the spec is **not** reverted and the status goes
+      on saying `reconciled` — applied on change, not enforced continuously — until any later
+      spec change re-applies the whole entry and restores LOGIN. And `ensure: absent` on a role
+      that owns objects is refused into `cannotReconcile: could not perform DELETE on role
+      analyst: 2 objects in database app` with a status of `pending-reconciliation`, on a cluster
+      that stays perfectly healthy.
+- [x] Password maintenance using Kubernetes secrets — the finding the lab is built on: editing the
+      password inside a managed role's Secret changed **nothing** for six minutes, because
+      CloudNativePG only watches Secrets labelled `cnpg.io/reload: "true"` — which its own
+      generated Secrets carry and a hand-made one does not. Labelling it applied the rotation in
+      ~8 seconds (`passwordStatus.resourceVersion` 1351 → 2154, transaction 757 → 770), and every
+      later edit landed just as fast. The one-line diagnosis is that resourceVersion against the
+      Secret's own. An `ALTER ROLE ... PASSWORD` in SQL is not reverted and the role still reads
+      `reconciled`; touching the Secret (an annotation, same password) had the operator overwrite
+      it on the next poll. `validUntil` in the past gives `FATAL: password authentication failed`
+      — PostgreSQL never says "expired" — and `disablePassword: true` is refused alongside a
+      `passwordSecret` ("This role both sets and disables a password") but on its own leaves
+      `rolpassword` NULL, `rolvaliduntil` back to `infinity` and `passwordStatus` carrying only a
+      transaction id.
 
 ## Tablespaces
 
-- [ ] Declarative creation of tablespaces
-- [ ] Declarative creation of temporary tablespaces
-- [ ] Backup / recovery from object storage
-- [ ] Backup / recovery from volume snapshots
+- [x] Declarative creation of tablespaces — one entry under `spec.tablespaces` becomes **one PVC
+      per instance**, `<instance>-tbs-<name>`, labelled `cnpg.io/pvcRole: PG_TABLESPACE` and
+      `cnpg.io/tablespaceName`; three instances and two tablespaces is six volumes. Attaching them
+      rolls the cluster (~50s) while `status.tablespacesStatus` goes pending → reconciled. The
+      implementation is visible: `pg_tablespace_location` reads
+      `/var/lib/postgresql/tablespaces/<name>/data` and `pg_tblspc/<oid>` is a symlink to it. The
+      webhook fills in `owner` (the app user), `temporary: false` and `resizeInUseVolumes: true`.
+      Removing one is refused outright — `no tablespace can be deleted once created`. A trap found
+      while building it and deliberately kept out of the lab: growing a tablespace on a class that
+      cannot expand is *accepted* by the webhook and then wedges the reconcile loop, leaving later
+      tablespaces `pending` behind a failing PVC resize.
+- [x] Declarative creation of temporary tablespaces — `temporary: true` also writes the name into
+      `temp_tablespaces`, on **every** instance. A temp table's `reltablespace` reads `scratch`; a
+      64kB-`work_mem` sort over 300k rows grew the tablespace to **99M** mid-query and took
+      `pg_stat_database` from `1 / 2734 kB` to `3 / 107 MB`. The evidence is emptiness, not
+      absence: `base/pgsql_tmp` exists (PostgreSQL makes it at startup) and stayed at 4.0K with
+      zero entries while the files piled up in a `pgsql_tmp` inside the tablespace. A read-only
+      sort through the -ro Service spilled on the standby that served it — 2 files / 22 MB there,
+      nothing on the other — since stats and storage are both per-instance.
+- [x] Backup / recovery from object storage — the backup contains the tablespaces and the recovery
+      manifest has to declare them. Two failures were measured and both are in the lab. Restoring
+      straight after a plugin backup failed with `object storage or file not found
+      000000010000000000000008: WAL not found`, because the segment `status.beginWal` names was
+      still open on an idle database — `pg_switch_wal()` is the fix. And recovering into a cluster
+      with no `tablespaces` block failed with `Barman cloud restore exception: [Errno 30]
+      Read-only file system: '/var/lib/postgresql/tablespaces'`, retried forever, the Cluster stuck
+      at `Setting up primary` and the reason only in `<cluster>-1-full-recovery-…` Job Pods that
+      keep being replaced. Declaring the tablespace brought it up healthy in ~40s with its own
+      claim and all 500 rows still inside the tablespace.
+- [x] Backup / recovery from volume snapshots — one snapshot **per volume**: `daily-snapshot` from
+      the data claim and `daily-snapshot-tbs-reporting` from the tablespace's, the latter labelled
+      `cnpg.io/tablespaceName`. Recovery is a hand-written map,
+      `volumeSnapshots.tablespaceStorage`, keyed by tablespace name, and leaving it out fails
+      *silently*: one Pending claim, no Pod, no events, an empty phase, and the reason only in the
+      operator log — `cannot create primary instance PVCs: missing StorageSource for tablespace
+      reporting PVC`. Mapped properly it is healthy in ~36s with each claim's `spec.dataSource`
+      naming its snapshot. **The naming trap that cost the most time: a cluster whose name contains
+      `-tbs-`** (here `pg-tbs-restored`) has its own data claim read as a tablespace's, and the
+      instance then rolls every twenty seconds forever — "original and target PodSpec differ in
+      volumes: element tbs-pgdata has been removed" — with the data correctly restored and the
+      cluster never ready. Renaming it, nothing else changed, fixed it.
 
 ## Declarative databases
 
-- [ ] Declarative creation of databases with default (retain) reclaim policy
-- [ ] Declarative creation of databases with delete reclaim policy
+- [x] Declarative creation of databases with default (retain) reclaim policy — a `Database` object
+      created the database in ~12s and reported `applied: true` in its own status; the webhook adds
+      `ensure: present`, `databaseReclaimPolicy: retain` and the finalizer
+      `cnpg.io/deleteDatabase`. A second object naming the same PostgreSQL database is accepted by
+      the API and refused by the operator in *its* status — `"reporting" is already managed by
+      object "reporting-db"` — leaving the first untouched. Deleting a retain object left the
+      database and its rows exactly where they were, and re-applying the identical manifest
+      **adopted** the existing database rather than failing or recreating it.
+- [x] Declarative creation of databases with delete reclaim policy — `delete` drops the database
+      when the object is deleted, and PostgreSQL will not drop a database with a session on it: the
+      deletion blocked with a `deletionTimestamp` set, the finalizer still attached, `applied: true`
+      unchanged, **no event, no message and no operator log line**, and the database still present.
+      A plain `kubectl delete` simply never returns. The moment the session ended, the object went
+      and the database was dropped. Contrasted with `ensure: absent`, which dropped a database
+      whose policy said `retain` — the policy was never consulted, because the object was never
+      deleted.
 
 ## Major version upgrade
 
-- [ ] Upgrade to the latest major version
+- [x] Upgrade to the latest major version — declarative, through `spec.imageName`, and a different
+      operation from a minor bump because the operator compares the new major against
+      `status.pgDataImageInfo` (the image that last ran on the data directory). A 3-instance
+      PostgreSQL 17.11 cluster reached 18.4 in about two minutes: the phase read `Upgrading Postgres
+      major version` while a `pg-cluster-1-major-upgrade` Job ran for ~31s, then both replicas were
+      **rebuilt from scratch** by ordinary `<instance>-join` Jobs. How pg_upgrade gets two
+      installations is the mechanism worth teaching — the Job's Pod is init `bootstrap-controller`
+      (operator image), init `prepare` running the **old** image (its log: *Copying the PostgreSQL
+      installation to the destination /controller/old*, then `/usr/lib/postgresql/17/{bin,lib}`,
+      `/usr/share/postgresql/17` and a `bindir.txt`), and main `major-upgrade` on the **new** image.
+      So the old image has to still be pullable. The primary keeps its PVC and the replicas get new
+      ones, which the claim timestamps show plainly. Three findings close the lab: going back is
+      refused at admission — `spec.imageName: Invalid value: "17": can't downgrade from major 18 to
+      17` — with no copy of the old cluster left on the volume; optimizer statistics do **not**
+      survive (`reltuples` reads `-1` and `pg_stats` is empty until `ANALYZE`, after which 50 and 2);
+      and the upgraded cluster reports `data_checksums off` while one freshly bootstrapped from the
+      *same* 18 image reports `on`, because pg_upgrade carries 17's initdb decisions forward.
 
 ## Content pipeline
 
 This app no longer simulates CNPG — `server/` is a real Go backend that provisions an
 actual k3d + MetalLB + SeaweedFS + CloudNativePG environment per attempt, and grading
 (`server/check.go`) runs real `kubectl`/`psql` against it. The pipeline below is how the
-28 built labs got their real command transcripts, object names and timings, and how each
+71 built labs got their real command transcripts, object names and timings, and how each
 future lab on this roadmap should be added:
 
 1. **Prove the mechanism against dbcanvas first, if it's new.** `../dbcanvas` (read-only,

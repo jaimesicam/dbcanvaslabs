@@ -62,6 +62,34 @@ var validLabs = map[string]bool{
 	"cnpg-replica-from-snapshot":    true,
 	"cnpg-initdb":                   true,
 	"cnpg-taints-tolerations":       true,
+	"cnpg-node-selector":            true,
+	"cnpg-podspec-drift":            true,
+	"cnpg-in-place-upgrade":         true,
+	"cnpg-multi-arch":               true,
+	"cnpg-inherited-metadata":       true,
+	"cnpg-object-metadata":          true,
+	"cnpg-data-corruption":          true,
+	"cnpg-basebackup-clone":         true,
+	"cnpg-import-microservice":      true,
+	"cnpg-import-monolith":          true,
+	"cnpg-storage-expansion":        true,
+	"cnpg-wal-volume":               true,
+	"cnpg-node-drain":               true,
+	"cnpg-single-instance-drain":    true,
+	"cnpg-declarative-hibernation":  true,
+	"cnpg-snapshot-modes":           true,
+	"cnpg-snapshot-pitr":            true,
+	"cnpg-plugin-snapshot-backup":   true,
+	"cnpg-scheduled-snapshots":      true,
+	"cnpg-managed-roles":            true,
+	"cnpg-role-passwords":           true,
+	"cnpg-tablespaces":              true,
+	"cnpg-temporary-tablespaces":    true,
+	"cnpg-tablespace-backup":        true,
+	"cnpg-tablespace-snapshot":      true,
+	"cnpg-declarative-databases":    true,
+	"cnpg-database-reclaim":         true,
+	"cnpg-major-upgrade":            true,
 }
 
 type Baseline struct {
@@ -251,6 +279,21 @@ func (a *Attempt) serverNodeName() string {
 	defer a.mu.Unlock()
 	for _, n := range a.nodes {
 		if n.Role == "control-plane" {
+			return n.ContainerName
+		}
+	}
+	return ""
+}
+
+// agentNodeName is the Kubernetes node name of the first worker node. The single-instance
+// drain lab pins its cluster there rather than to the control plane: draining the control
+// plane would also evict CoreDNS and the local-path provisioner, which has nothing to do with
+// what that lab is teaching and quite a lot to do with confusing it.
+func (a *Attempt) agentNodeName() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, n := range a.nodes {
+		if n.Role != "control-plane" {
 			return n.ContainerName
 		}
 	}
@@ -615,6 +658,33 @@ func (s *AttemptStore) recipe(ctx context.Context, a *Attempt, serverID, manifes
 	psqlClient := provisionStep{"start psql client", func() error {
 		return s.cnpg.ApplyPSQLClient(ctx, serverID, cluster, a.log)
 	}}
+	declareManagedRole := provisionStep{"declare a managed role", func() error {
+		return s.cnpg.DeclareManagedRole(ctx, serverID, cluster, "analyst", "analyst-password", "analyst_pw", a.log)
+	}}
+	// The tablespaces the object-store and snapshot backup labs recover: declared server-side,
+	// because those labs are about backing them up rather than about creating them.
+	backupTablespaces := []tablespaceSpec{{Name: "reporting", Size: "1Gi", Owner: "app"}}
+	declareBackupTablespaces := provisionStep{"declare a tablespace", func() error {
+		return s.cnpg.DeclareTablespaces(ctx, serverID, cluster, backupTablespaces, a.log)
+	}}
+	seedTablespaceTable := provisionStep{"seed a table inside the tablespace", func() error {
+		return s.cnpg.SeedTablespaceTable(ctx, serverID, cluster, "quarterly", "reporting", 500, a.log)
+	}}
+	stageTablespaceRestores := provisionStep{"stage the recovery manifests", func() error {
+		return s.cnpg.StageTablespaceRestoreManifests(ctx, serverID, cluster, backupTablespaces, a.log)
+	}}
+	applySnapshotClusterTablespaces := provisionStep{"apply a cluster with a tablespace", func() error {
+		return s.cnpg.ApplySnapshotClusterTablespaces(ctx, serverID, cluster, a.serverNodeName(), backupTablespaces, a.log)
+	}}
+	stageTablespaceSnapshots := provisionStep{"stage the snapshot backup and recovery manifests", func() error {
+		return s.cnpg.StageTablespaceSnapshotManifests(ctx, serverID, cluster, a.serverNodeName(), backupTablespaces, a.log)
+	}}
+	stageRetainDatabases := provisionStep{"stage the Database manifests", func() error {
+		return s.cnpg.StageDatabaseManifests(ctx, serverID, cluster, "retain", a.log)
+	}}
+	stageReclaimDatabases := provisionStep{"stage the Database manifests", func() error {
+		return s.cnpg.StageDatabaseManifests(ctx, serverID, cluster, "reclaim", a.log)
+	}}
 	stagePooler := provisionStep{"stage pooler manifest", func() error {
 		return s.cnpg.StagePoolerManifest(ctx, serverID, cluster, 2)
 	}}
@@ -711,6 +781,15 @@ func (s *AttemptStore) recipe(ctx context.Context, a *Attempt, serverID, manifes
 	applyClusterPreviousImage := provisionStep{"apply cluster", func() error {
 		return s.cnpg.ApplyClusterImage(ctx, serverID, cluster, 3, "1Gi", cnpgPreviousPostgresImage, a.log)
 	}}
+	// The major-upgrade lab: both majors pre-seeded (pg_upgrade needs the old binaries as well
+	// as the new ones), and a cluster started on the older one.
+	preseedBothMajors := provisionStep{"pre-seed both PostgreSQL majors", func() error {
+		s.k3d.PreseedImages(ctx, a.clusterNameSnap(), []string{cnpgMajorPreviousPostgresImage}, a.log)
+		return nil
+	}}
+	applyClusterMajorPrevious := provisionStep{"apply cluster on the older major", func() error {
+		return s.cnpg.ApplyClusterImage(ctx, serverID, cluster, 3, "1Gi", cnpgMajorPreviousPostgresImage, a.log)
+	}}
 	stageInitdb := provisionStep{"stage the initdb cluster manifest", func() error {
 		return s.cnpg.StageInitdbManifest(ctx, serverID, "pg-init", a.log)
 	}}
@@ -731,6 +810,47 @@ func (s *AttemptStore) recipe(ctx context.Context, a *Attempt, serverID, manifes
 	}}
 	stageLogicalManifests := provisionStep{"stage logical replication manifests", func() error {
 		return s.cnpg.StageLogicalManifests(ctx, serverID, cluster, "pg-target", a.log)
+	}}
+	// The corruption lab damages one page of a real table, so it needs a real table with
+	// enough rows to make the loss legible — and it has to be read once and checkpointed while
+	// the environment is built, for the hint-bit reason SeedAppTable explains.
+	seedLedger := provisionStep{"seed the ledger table", func() error {
+		return s.cnpg.SeedAppTable(ctx, serverID, cluster, "ledger", 2000, a.log)
+	}}
+	seedNotes := provisionStep{"seed the notes table", func() error {
+		return s.cnpg.SeedAppTable(ctx, serverID, cluster, "notes", 50, a.log)
+	}}
+	seedSourceServer := provisionStep{"seed the source server", func() error {
+		return s.cnpg.SeedSourceServer(ctx, serverID, cluster, a.log)
+	}}
+	stageClone := provisionStep{"stage the clone manifest", func() error {
+		return s.cnpg.StageCloneManifest(ctx, serverID, cluster, "pg-clone", a.log)
+	}}
+	stageMicroserviceImport := provisionStep{"stage the import manifest", func() error {
+		return s.cnpg.StageImportManifest(ctx, serverID, cluster, "pg-orders", "microservice", a.log)
+	}}
+	stageMonolithImport := provisionStep{"stage the import manifest", func() error {
+		return s.cnpg.StageImportManifest(ctx, serverID, cluster, "pg-estate", "monolith", a.log)
+	}}
+	// The single-instance drain lab needs its one instance on a worker node, so the drain it
+	// performs is a drain of an ordinary node.
+	applyPinnedSingle := provisionStep{"apply a single-instance cluster", func() error {
+		return s.cnpg.ApplyClusterOnNode(ctx, serverID, cluster, 1, "1Gi", a.agentNodeName(), a.log)
+	}}
+	stageSnapshotModes := provisionStep{"stage the hot and cold backup manifests", func() error {
+		return s.cnpg.StageSnapshotModeManifests(ctx, serverID, cluster, a.serverNodeName(), a.log)
+	}}
+	// The snapshot-PITR lab needs a WAL archive as well as a snapshot-capable driver: a
+	// snapshot restores you to the instant it was taken, and everything after that comes out of
+	// the object store. Single-instance, because the CSI driver lives on one node.
+	configureBackupSingle := provisionStep{"configure wal archiving", func() error {
+		return s.cnpg.ConfigureBarmanBackupInstances(ctx, serverID, cluster, 1, a.log)
+	}}
+	stagePITRSnapshots := provisionStep{"stage the snapshot PITR manifests", func() error {
+		return s.cnpg.StagePITRSnapshotManifests(ctx, serverID, cluster, a.serverNodeName(), a.log)
+	}}
+	stageScheduledSnapshots := provisionStep{"stage the scheduled backup manifests", func() error {
+		return s.cnpg.StageScheduledSnapshotManifests(ctx, serverID, cluster, a.log)
 	}}
 	captureBaseline := provisionStep{"capture baseline", func() error {
 		primary, volume, node, err := s.cnpg.Baseline(ctx, serverID, cluster)
@@ -841,6 +961,113 @@ func (s *AttemptStore) recipe(ctx context.Context, a *Attempt, serverID, manifes
 		return []provisionStep{installOperator, stageInitdb}
 	case "cnpg-taints-tolerations":
 		return []provisionStep{installOperator, applyCluster, installPlugin, psqlClient}
+	case "cnpg-node-selector":
+		// One instance per node, placed by the anti-affinity the operator defaults in — which
+		// is exactly what the lab reads before changing it. Nothing is staged: every field it
+		// touches is a patch on the running Cluster.
+		return []provisionStep{installOperator, applyCluster, psqlClient}
+	case "cnpg-podspec-drift":
+		// The baseline records which instance is primary, so the grader can prove the rollout
+		// the learner triggers replaced every Pod *without* moving the primary.
+		return []provisionStep{installOperator, applyCluster, psqlClient, captureBaseline}
+	case "cnpg-multi-arch":
+		return []provisionStep{installOperator, applyCluster, psqlClient}
+	case "cnpg-inherited-metadata":
+		return []provisionStep{installOperator, applyCluster, psqlClient}
+	case "cnpg-object-metadata":
+		return []provisionStep{installOperator, applyCluster, psqlClient}
+	case "cnpg-data-corruption":
+		// The plugin is the lab's toolkit: fencing to stop PostgreSQL without losing the Pod,
+		// promote to move the writes off the damaged instance, destroy to throw its disk away.
+		// The baseline records which instance is primary and which volume it is on, so the
+		// grader can prove the damaged copy was replaced rather than repaired.
+		return []provisionStep{installOperator, applyCluster, installPlugin, psqlClient, seedLedger, captureBaseline}
+	case "cnpg-basebackup-clone":
+		return []provisionStep{installOperator, applyCluster, psqlClient, seedNotes, stageClone}
+	case "cnpg-import-microservice":
+		return []provisionStep{installOperator, applyCluster, psqlClient, seedSourceServer, stageMicroserviceImport}
+	case "cnpg-import-monolith":
+		return []provisionStep{installOperator, applyCluster, psqlClient, seedSourceServer, stageMonolithImport}
+	case "cnpg-storage-expansion":
+		// The snapshot-capable CSI driver is here for a different property of it: unlike k3s's
+		// own local-path, its StorageClass allows volume expansion. Both classes exist, which
+		// is what makes the comparison in the first objective real.
+		return []provisionStep{
+			preseedSnapshotStack, installSnapshotStack, installOperator,
+			applySnapshotCluster, psqlClient, seedNotes, captureBaseline,
+		}
+	case "cnpg-wal-volume":
+		return []provisionStep{installOperator, applyCluster, psqlClient, seedNotes}
+	case "cnpg-node-drain":
+		return []provisionStep{installOperator, applyCluster, psqlClient, captureBaseline}
+	case "cnpg-single-instance-drain":
+		return []provisionStep{installOperator, applyPinnedSingle, psqlClient}
+	case "cnpg-declarative-hibernation":
+		return []provisionStep{installOperator, applyCluster, psqlClient, seedNotes}
+	case "cnpg-snapshot-modes":
+		return []provisionStep{
+			preseedSnapshotStack, installSnapshotStack, installOperator,
+			applySnapshotCluster, psqlClient, seedNotes, stageSnapshotModes,
+		}
+	case "cnpg-snapshot-pitr":
+		// Both stacks: the CSI driver for the snapshots and the Barman Cloud plugin for the WAL
+		// archive the recovery replays out of.
+		return []provisionStep{
+			preseedSnapshotStack, installSnapshotStack, installOperator,
+			preseedBackupStack, installCertManager, installBarmanPlugin,
+			applySnapshotCluster, exposeSeaweed, psqlClient, seedNotes,
+			configureBackupSingle, stagePITRSnapshots,
+		}
+	case "cnpg-plugin-snapshot-backup":
+		// The cnpg plugin is the subject, so nothing is staged: every object this lab creates is
+		// created by a plugin command.
+		return []provisionStep{
+			preseedSnapshotStack, installSnapshotStack, installOperator,
+			applySnapshotCluster, installPlugin, psqlClient, seedNotes,
+		}
+	case "cnpg-scheduled-snapshots":
+		return []provisionStep{
+			preseedSnapshotStack, installSnapshotStack, installOperator,
+			applySnapshotCluster, psqlClient, seedNotes, stageScheduledSnapshots,
+		}
+	case "cnpg-managed-roles":
+		return []provisionStep{installOperator, applyCluster, psqlClient}
+	case "cnpg-major-upgrade":
+		// Starts a whole major version behind, so changing the image is a pg_upgrade rather than
+		// a rolling restart. Seeded, because what a major upgrade has to carry across is data.
+		return []provisionStep{
+			preseedBothMajors, installOperator, applyClusterMajorPrevious, psqlClient, seedNotes,
+		}
+	case "cnpg-tablespaces":
+		// A plain cluster: declaring the tablespaces is the lab.
+		return []provisionStep{installOperator, applyCluster, psqlClient}
+	case "cnpg-temporary-tablespaces":
+		return []provisionStep{installOperator, applyCluster, psqlClient}
+	case "cnpg-tablespace-backup":
+		// Tablespaces first, then WAL archiving: both roll the cluster, and the backup has to be
+		// taken from a cluster whose tablespaces already exist.
+		return []provisionStep{
+			preseedBackupStack, installOperator, installCertManager, installBarmanPlugin,
+			applyCluster, exposeSeaweed, psqlClient, declareBackupTablespaces, seedTablespaceTable,
+			configureBackup, stageTablespaceRestores,
+		}
+	case "cnpg-tablespace-snapshot":
+		return []provisionStep{
+			preseedSnapshotStack, installSnapshotStack, installOperator,
+			applySnapshotClusterTablespaces, psqlClient, seedTablespaceTable, stageTablespaceSnapshots,
+		}
+	case "cnpg-declarative-databases":
+		return []provisionStep{installOperator, applyCluster, psqlClient, stageRetainDatabases}
+	case "cnpg-database-reclaim":
+		return []provisionStep{installOperator, applyCluster, psqlClient, stageReclaimDatabases}
+	case "cnpg-role-passwords":
+		// The role and its Secret are the *precondition* here — what this lab teaches is what
+		// happens to that password afterwards, so the environment arrives with both in place.
+		return []provisionStep{installOperator, applyCluster, psqlClient, declareManagedRole}
+	case "cnpg-in-place-upgrade":
+		// Starts on the previous minor release, like the operator-upgrade recipe: an in-place
+		// instance-manager update can only be watched across a real operator version change.
+		return []provisionStep{preseedPreviousOperator, installPreviousOperator, applyCluster, psqlClient}
 	case "cnpg-image-catalog":
 		// Starts a minor release behind, like the rolling-update lab, so moving the catalog
 		// forward is a real image change.

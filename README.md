@@ -121,7 +121,7 @@ those leftovers automatically.
 
 ## What it does
 
-- **43-lab catalog** — all CloudNativePG on PostgreSQL today, all playable end to end
+- **71-lab catalog** — all CloudNativePG on PostgreSQL today, all playable end to end
   against real infrastructure:
   - *Kubernetes Operator* (4) — installing the operator, creating a Cluster, persistent volumes,
     database initialization with initdb
@@ -199,7 +199,7 @@ solution revealed or timed out **0%**.
 
 ```
 src/
-  labs/        catalog.json + the forty-three lab definitions (content only — no grading)
+  labs/        catalog.json + the seventy-one lab definitions (content only — no grading)
   reference/   Command Reference content, one module per technology
   cards/       Index Card decks, one module per technology
   pages/       Catalog  LabDetail  LabPlayer  Reference  Cards  Progress  Gradebook  ManageUsers

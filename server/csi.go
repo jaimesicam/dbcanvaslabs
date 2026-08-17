@@ -47,6 +47,21 @@ const (
 	snapshotStorageClass = "csi-hostpath-sc"
 	snapshotClassName    = "csi-hostpath-snapclass"
 	restoredClusterName  = "pg-cluster-restored"
+
+	// The hot/cold snapshot lab's own objects.
+	hotBackupName           = "hot-backup"
+	coldBackupName          = "cold-backup"
+	coldRestoredClusterName = "pg-restored"
+
+	// The tablespace-snapshot lab's own objects. Neither name contains "-tbs-", and that is
+	// load-bearing rather than cosmetic: a tablespace's claim is named <instance>-tbs-<tablespace>,
+	// and a *cluster* called pg-tbs-restored made the operator read its own data claim as a
+	// tablespace's. The restored cluster then rolled its instance forever — "original and target
+	// PodSpec differ in volumes: element tbs-pgdata has been removed" — with the data correctly
+	// restored and the cluster never becoming ready. Measured twice, and fixed by the name alone.
+	tbsBackupName          = "daily-snapshot"
+	tbsRestoredClusterName = "pg-restored"
+	tbsHalfClusterName     = "pg-half"
 )
 
 // csiSnapshotImages is everything the snapshot stack pulls, pre-seeded into the nodes for
@@ -369,6 +384,144 @@ spec:
 %s`, name, cnpgPostgresImage, nodeName, snapshotStorageClass, bootstrap)
 }
 
+// snapshotClusterTablespacesManifest is the tablespace-snapshot lab's source cluster: one
+// instance on the snapshot-capable class, with its tablespaces on that same class. The class
+// matters — a tablespace on a driver that cannot snapshot would leave a backup with a hole in it,
+// which is the failure this lab is arranged to avoid rather than to demonstrate.
+func snapshotClusterTablespacesManifest(name, nodeName string, specs []tablespaceSpec) string {
+	var tbs strings.Builder
+	tbs.WriteString("  tablespaces:\n")
+	for _, t := range specs {
+		fmt.Fprintf(&tbs, "  - name: %s\n    storage:\n      size: %s\n      storageClass: %s\n",
+			t.Name, t.Size, snapshotStorageClass)
+	}
+	return fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %s
+  namespace: default
+spec:
+  instances: 1
+  imageName: %s
+  affinity:
+    nodeSelector:
+      kubernetes.io/hostname: %s
+  storage:
+    size: 1Gi
+    storageClass: %s
+%s  backup:
+    volumeSnapshot:
+      className: %s
+      online: true
+`, name, cnpgPostgresImage, nodeName, snapshotStorageClass, tbs.String(), snapshotClassName)
+}
+
+// ApplySnapshotClusterTablespaces creates that cluster and waits for it to be healthy with every
+// tablespace reconciled.
+func (c *CNPG) ApplySnapshotClusterTablespaces(ctx context.Context, serverID, name, nodeName string, specs []tablespaceSpec, logf func(string)) error {
+	body := snapshotClusterTablespacesManifest(name, nodeName, specs)
+	if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", "cluster.yaml", []byte(body), 0644); err != nil {
+		return err
+	}
+	logf("kubectl apply -f cluster.yaml (one instance and its tablespaces, all on " + snapshotStorageClass + ")")
+	if res, err := c.k3d.Kubectl(ctx, serverID, "apply", "-f", "/root/cluster.yaml"); err != nil {
+		return err
+	} else if res.ExitCode != 0 {
+		return fmt.Errorf("kubectl apply cluster: exit %d: %s", res.ExitCode, res.Stderr)
+	}
+
+	logf("waiting for the cluster and its tablespaces")
+	want := strings.Repeat("reconciled ", len(specs))
+	deadline := time.Now().Add(10 * time.Minute)
+	for time.Now().Before(deadline) {
+		res, err := c.k3d.Kubectl(ctx, serverID, "get", "cluster.postgresql.cnpg.io", name,
+			"-o", `jsonpath={.status.phase}|{range .status.tablespacesStatus[*]}{.state} {end}`)
+		if err == nil && res.ExitCode == 0 &&
+			strings.TrimSpace(res.Stdout) == strings.TrimSpace("Cluster in healthy state|"+want) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return fmt.Errorf("timed out waiting for %s and its tablespaces", name)
+}
+
+// StageTablespaceSnapshotManifests writes what the tablespace-snapshot lab applies: a
+// volumeSnapshot Backup, and a recovery Cluster whose snapshot names are left as placeholders.
+//
+// The placeholders are the point. A snapshot backup of a cluster with tablespaces produces one
+// VolumeSnapshot per volume, and recovery has to map every one of them back by hand under
+// `volumeSnapshots.tablespaceStorage`, keyed by tablespace name. Handing the learner a finished
+// file would hide exactly the step that goes wrong in real life.
+func (c *CNPG) StageTablespaceSnapshotManifests(ctx context.Context, serverID, clusterName, nodeName string, specs []tablespaceSpec, logf func(string)) error {
+	backup := fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: %s
+  namespace: default
+spec:
+  cluster:
+    name: %s
+  method: volumeSnapshot
+  online: true
+`, tbsBackupName, clusterName)
+
+	var tbsDecl, tbsStorage strings.Builder
+	tbsDecl.WriteString("  tablespaces:\n")
+	tbsStorage.WriteString("        tablespaceStorage:\n")
+	for _, t := range specs {
+		fmt.Fprintf(&tbsDecl, "  - name: %s\n    storage:\n      size: %s\n      storageClass: %s\n",
+			t.Name, t.Size, snapshotStorageClass)
+		fmt.Fprintf(&tbsStorage, "          %s:\n            name: %s_SNAPSHOT\n            kind: VolumeSnapshot\n            apiGroup: snapshot.storage.k8s.io\n",
+			t.Name, strings.ToUpper(t.Name))
+	}
+
+	restore := fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %s
+  namespace: default
+spec:
+  instances: 1
+  imageName: %s
+  affinity:
+    nodeSelector:
+      kubernetes.io/hostname: %s
+  storage:
+    size: 1Gi
+    storageClass: %s
+%s  bootstrap:
+    recovery:
+      volumeSnapshots:
+        storage:
+          name: DATA_SNAPSHOT
+          kind: VolumeSnapshot
+          apiGroup: snapshot.storage.k8s.io
+%s`, tbsRestoredClusterName, cnpgPostgresImage, nodeName, snapshotStorageClass, tbsDecl.String(), tbsStorage.String())
+
+	// The same recovery with the tablespace mapping left out entirely — the lab applies it on
+	// purpose to see what the operator does when a tablespace has no snapshot behind it.
+	half := strings.Replace(
+		strings.Replace(restore, tbsRestoredClusterName, tbsHalfClusterName, 1),
+		tbsStorage.String(), "", 1)
+
+	files := map[string]string{
+		"snapshot-backup.yaml":       backup,
+		"restore.yaml.template":      restore,
+		"restore-half.yaml.template": half,
+	}
+	logf("staging a volumeSnapshot Backup and two recovery templates, one of them missing the tablespace mapping")
+	for name, body := range files {
+		if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", name, []byte(body), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ApplySnapshotCluster creates the lab's source cluster and waits for it to be healthy.
 func (c *CNPG) ApplySnapshotCluster(ctx context.Context, serverID, name, nodeName string, logf func(string)) error {
 	body := snapshotClusterManifest(name, nodeName, "")
@@ -417,6 +570,155 @@ spec:
 		"snapshot-backup.yaml":  backup,
 		"restored-cluster.yaml": snapshotClusterManifest(restoredClusterName, nodeName, "snapshot-backup"),
 	} {
+		if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", name, []byte(body), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StageSnapshotModeManifests writes the three manifests the hot/cold snapshot lab applies: two
+// Backup requests that differ in one field, and a Cluster that recovers from the cold one.
+//
+// `online` is the field. True — the default — takes the snapshot while PostgreSQL is running,
+// bracketed by pg_backup_start and pg_backup_stop, so the volume is copied mid-flight and the
+// snapshot carries a backup label telling recovery where to begin. False fences the target
+// instance first, so what is copied is a cleanly shut down data directory: no backup label, and
+// a control file that says so.
+func (c *CNPG) StageSnapshotModeManifests(ctx context.Context, serverID, clusterName, nodeName string, logf func(string)) error {
+	backup := func(name string, online bool) string {
+		return fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: %s
+  namespace: default
+spec:
+  cluster:
+    name: %s
+  method: volumeSnapshot
+  online: %t
+`, name, clusterName, online)
+	}
+
+	files := map[string]string{
+		"hot-backup.yaml":  backup(hotBackupName, true),
+		"cold-backup.yaml": backup(coldBackupName, false),
+		// Recovering from a snapshot is the same manifest whichever mode produced it — which
+		// is the point the last objective checks.
+		"restore-cold.yaml": snapshotClusterManifest(coldRestoredClusterName, nodeName, coldBackupName),
+	}
+	logf("staging the hot and cold Backup manifests, and a cluster that recovers from the cold one")
+	for name, body := range files {
+		if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", name, []byte(body), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StagePITRSnapshotManifests writes what the snapshot-PITR lab applies: a hot and a cold Backup
+// request, and two recovery Clusters that start from those snapshots and then replay WAL out of
+// the object store up to a moment the learner chooses.
+//
+// The shape worth reading is the recovery block. `volumeSnapshots` says where the data directory
+// comes from; `source` names an external cluster the WAL archive is behind; `recoveryTarget`
+// says where to stop. A snapshot alone can only ever restore you to the instant it was taken —
+// everything after that instant comes from the archive, which is why both halves are here.
+func (c *CNPG) StagePITRSnapshotManifests(ctx context.Context, serverID, clusterName, nodeName string, logf func(string)) error {
+	backup := func(name string, online bool) string {
+		return fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: %s
+  namespace: default
+spec:
+  cluster:
+    name: %s
+  method: volumeSnapshot
+  online: %t
+`, name, clusterName, online)
+	}
+
+	// TARGET_TIME is left for the learner to substitute, exactly as the object-store PITR
+	// template does: choosing the moment is the lab.
+	recover := func(name, snapshot string) string {
+		return fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %s
+  namespace: default
+spec:
+  instances: 1
+  imageName: %s
+  affinity:
+    nodeSelector:
+      kubernetes.io/hostname: %s
+  storage:
+    size: 1Gi
+    storageClass: %s
+  bootstrap:
+    recovery:
+      source: origin
+      volumeSnapshots:
+        storage:
+          name: %s
+          kind: VolumeSnapshot
+          apiGroup: snapshot.storage.k8s.io
+      recoveryTarget:
+        targetTime: "TARGET_TIME"
+  externalClusters:
+  - name: origin
+    plugin:
+      name: %s
+      parameters:
+        barmanObjectName: %s
+        serverName: %s
+`, name, cnpgPostgresImage, nodeName, snapshotStorageClass, snapshot, barmanPluginName, objectStoreName, clusterName)
+	}
+
+	files := map[string]string{
+		"hot-backup.yaml":         backup(hotBackupName, true),
+		"cold-backup.yaml":        backup(coldBackupName, false),
+		"pitr-hot.yaml.template":  recover("pg-hot-pitr", hotBackupName),
+		"pitr-cold.yaml.template": recover("pg-cold-pitr", coldBackupName),
+	}
+	logf("staging the hot and cold Backup manifests and two point-in-time recovery templates")
+	for name, body := range files {
+		if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", name, []byte(body), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StageScheduledSnapshotManifests writes the two ScheduledBackups the declarative-backup lab
+// applies: one that runs online on a schedule, and one that runs cold. Both are staged, because
+// declaring them is the lab.
+func (c *CNPG) StageScheduledSnapshotManifests(ctx context.Context, serverID, clusterName string, logf func(string)) error {
+	scheduled := func(name, schedule string, online, immediate bool) string {
+		return fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: %s
+  namespace: default
+spec:
+  schedule: "%s"
+  immediate: %t
+  backupOwnerReference: self
+  cluster:
+    name: %s
+  method: volumeSnapshot
+  online: %t
+`, name, schedule, immediate, clusterName, online)
+	}
+
+	files := map[string]string{
+		// Six fields, not five: CloudNativePG's schedule includes seconds.
+		"scheduled-online.yaml": scheduled("every-minute-online", "0 * * * * *", true, true),
+		"scheduled-cold.yaml":   scheduled("every-two-minutes-cold", "0 */2 * * * *", false, false),
+	}
+	logf("staging the online and cold ScheduledBackup manifests")
+	for name, body := range files {
 		if err := c.k3d.docker.PutArchive(ctx, serverID, "/root", name, []byte(body), 0644); err != nil {
 			return err
 		}
