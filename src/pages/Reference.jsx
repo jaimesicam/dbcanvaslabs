@@ -73,7 +73,7 @@ function LabChips({ labIds }) {
 
 function CommandCard({ cmd }) {
   return (
-    <div className="rounded-sm border bg-surface">
+    <div id={`cmd-${cmd.id}`} className="scroll-mt-5 rounded-sm border bg-surface">
       <div className="space-y-2 border-b px-4 py-3">
         <h4 className="data break-words text-sm font-semibold text-fg">{cmd.name}</h4>
         <p className="text-xs leading-relaxed text-muted">{cmd.summary}</p>
@@ -145,17 +145,31 @@ function ReferenceIndex() {
   )
 }
 
-export function Reference({ refId }) {
+/**
+ * `#/reference/<ref>` lists everything; `…/lab/<labId>` narrows it to the entries that name
+ * that lab in `usedIn` — the link an index card or a lab detail page follows. `usedIn` is
+ * authored and checked against the catalog, so the narrowing needs no mapping of its own.
+ */
+function parsePath(path) {
+  const [refId, mode, arg] = String(path || '').split('/')
+  return { refId: refId || null, labId: mode === 'lab' ? arg || null : null }
+}
+
+export function Reference({ path }) {
   const [query, setQuery] = useState('')
+  const { refId, labId } = parsePath(path)
   const ref = refId ? getReference(refId) : null
   const q = query.trim().toLowerCase()
 
   const groups = useMemo(() => {
     if (!ref) return []
     return ref.groups
-      .map((g) => ({ ...g, commands: g.commands.filter((c) => matches(c, q)) }))
+      .map((g) => ({
+        ...g,
+        commands: g.commands.filter((c) => matches(c, q) && (!labId || (c.usedIn || []).includes(labId))),
+      }))
       .filter((g) => g.commands.length > 0)
-  }, [ref, q])
+  }, [ref, q, labId])
 
   if (!refId) return <ReferenceIndex />
 
@@ -195,7 +209,7 @@ export function Reference({ refId }) {
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
         <nav className="rounded-sm border bg-surface p-2 lg:sticky lg:top-5 lg:w-56 lg:shrink-0">
           <div className="microlabel px-2 pb-1.5 pt-1">Sections</div>
-          {ref.groups.map((g) => (
+          {groups.map((g) => (
             <a
               key={g.id}
               href={`#/reference/${ref.id}`}
@@ -212,6 +226,29 @@ export function Reference({ refId }) {
         </nav>
 
         <div className="min-w-0 flex-1 space-y-5">
+          {labId && (
+            <div className="panel flex flex-wrap items-center gap-2 px-3 py-2">
+              <Icon.Book size={14} className="shrink-0 text-primary" />
+              <span className="text-xs">
+                The <strong className="font-semibold">{shown}</strong> commands used in{' '}
+                <button
+                  onClick={() => navigate(`lab/${labId}`)}
+                  className="font-semibold text-primary transition hover:underline"
+                >
+                  {BY_ID[labId]?.title || labId}
+                </button>
+              </span>
+              <Button
+                size="xs"
+                variant="outline"
+                className="ml-auto"
+                onClick={() => navigate(`reference/${ref.id}`)}
+              >
+                Show all {total}
+              </Button>
+            </div>
+          )}
+
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
               <Icon.Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" />

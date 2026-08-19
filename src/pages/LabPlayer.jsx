@@ -11,6 +11,7 @@ import { clockDuration } from '../lib/format.js'
 import { navigate } from '../lib/router.js'
 import { useAuth } from '../auth/AuthProvider.jsx'
 import { getLab, getPlayable } from '../labs/index.js'
+import { cardsForLab } from '../cards/index.js'
 import { ThemePicker } from '../theme/ThemePicker.jsx'
 import { VoicePicker } from '../speech/VoicePicker.jsx'
 import { compact, textBlock } from '../speech/speakable.js'
@@ -401,6 +402,9 @@ function Provisioning({ lab, play, phaseLog, error, onRetry, onAbort, aborting }
 
 function Debrief({ lab, play, attempt, onClose, onLeave }) {
   const score = attemptScore(attempt, play.tasks.length)
+  // The cluster is about to be destroyed, so what the learner keeps is the material. The
+  // cards for this lab are the one thing here that outlives the environment.
+  const cards = cardsForLab(lab.id)
   const verified = attempt.tasks.filter((t) => t.status !== TASK_STATUS.timeout).length
   const totalTime = attempt.tasks.reduce((n, t) => n + t.timeSpentMs, 0)
 
@@ -458,6 +462,16 @@ function Debrief({ lab, play, attempt, onClose, onLeave }) {
           <Button size="sm" onClick={() => onLeave('progress')}>
             <Icon.Chart size={14} /> My progress
           </Button>
+          {cards.length > 0 && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onLeave(`cards/${cards[0].deckId}/lab/${lab.id}`)}
+              title="Test yourself on what this lab taught"
+            >
+              <Icon.Bulb size={14} /> Review the {cards.length} cards
+            </Button>
+          )}
           <Button size="sm" variant="outline" onClick={() => onLeave('catalog')}>
             Back to catalog
           </Button>

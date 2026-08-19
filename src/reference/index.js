@@ -17,3 +17,15 @@ export function getReference(id) {
 export function allCommands() {
   return REFERENCES.flatMap((r) => r.groups.flatMap((g) => g.commands.map((c) => ({ ...c, refId: r.id, groupId: g.id }))))
 }
+
+/**
+ * Every command entry that names this lab in `usedIn`, with the reference it belongs to.
+ *
+ * The same authored relationship the index cards use: a card and a command entry that cite
+ * the same lab are about the same material, which is a link nothing has to guess at.
+ */
+export function commandsForLab(labId) {
+  return REFERENCES.flatMap((r) =>
+    r.groups.flatMap((g) => g.commands.filter((c) => (c.usedIn || []).includes(labId)).map((c) => ({ ...c, refId: r.id, groupId: g.id }))),
+  )
+}

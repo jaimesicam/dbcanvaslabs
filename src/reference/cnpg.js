@@ -3795,7 +3795,7 @@ pg-restored   36s   1   1   Cluster in healthy state   pg-restored-1
     },
 
     {
-      id: 'operator',
+      id: 'operator-runtime',
       title: 'The operator itself',
       blurb:
         'What an installed operator consists of, how it is configured, and what stops working when it is not running.',

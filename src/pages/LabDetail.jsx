@@ -6,6 +6,9 @@ import { Topology } from '../services/Topology.jsx'
 import { navigate } from '../lib/router.js'
 import { useAuth } from '../auth/AuthProvider.jsx'
 import { attemptScore, attemptsFor } from '../store/progress.js'
+import { cardsForLab } from '../cards/index.js'
+import { commandsForLab } from '../reference/index.js'
+import { loadReview, statsFor } from '../cards/review.js'
 import { DIFFICULTY_TONE, getLab, getPlayable, taskBudgetMs } from '../labs/index.js'
 import { clockDuration, humanDuration } from '../lib/format.js'
 import { compact, lectureBlocks, textBlock } from '../speech/speakable.js'
@@ -33,6 +36,21 @@ export function LabDetail({ labId }) {
     [play],
   )
   const attempts = useMemo(() => attemptsFor(user.id).filter((a) => a.labId === labId), [user.id, labId])
+
+  // What else in the app covers this lab's material. Both relationships come from `usedIn`,
+  // which is authored per card and per command entry and checked against the catalog — so
+  // neither of these links is inferred from the text.
+  const study = useMemo(() => {
+    const cards = cardsForLab(labId)
+    const commands = commandsForLab(labId)
+    return {
+      cards,
+      commands,
+      deckId: cards[0]?.deckId ?? null,
+      refId: commands[0]?.refId ?? null,
+      due: statsFor(cards, loadReview(user.id)).due,
+    }
+  }, [labId, user.id])
 
   // One continuous reading of the page, in the order the eye takes it: what this lab is,
   // what it asks of you, then the background. The three parts live in different cards, so
@@ -236,6 +254,45 @@ export function LabDetail({ labId }) {
                     <span className="text-muted">terminal</span>
                   </div>
                 ))}
+              </div>
+            </Card>
+          )}
+
+          {(study.cards.length > 0 || study.commands.length > 0) && (
+            <Card title="Study this material" subtitle="The same ground, arranged for recall and for lookup">
+              <div className="space-y-2">
+                {study.cards.length > 0 && (
+                  <div className="flex items-center gap-3 rounded-sm border bg-bg p-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium">
+                        {study.cards.length} index card{study.cards.length === 1 ? '' : 's'}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-muted">
+                        {study.due > 0 ? `${study.due} due now` : 'nothing due — study them anyway'}
+                      </p>
+                    </div>
+                    <Button size="xs" onClick={() => navigate(`cards/${study.deckId}/lab/${labId}`)}>
+                      <Icon.Bulb size={13} /> Study
+                    </Button>
+                  </div>
+                )}
+                {study.commands.length > 0 && (
+                  <div className="flex items-center gap-3 rounded-sm border bg-bg p-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium">
+                        {study.commands.length} command{study.commands.length === 1 ? '' : 's'}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-muted">each with a real example and its real output</p>
+                    </div>
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => navigate(`reference/${study.refId}/lab/${labId}`)}
+                    >
+                      <Icon.Book size={13} /> Reference
+                    </Button>
+                  </div>
+                )}
               </div>
             </Card>
           )}

@@ -163,8 +163,8 @@ export function App() {
   let page
   if (route.path === 'lab' && route.param) page = <LabDetail labId={route.param} />
   else if (route.path === 'progress') page = <Progress />
-  else if (route.path === 'reference') page = <Reference refId={route.param} />
-  else if (route.path === 'cards') page = <Cards deckId={route.param} />
+  else if (route.path === 'reference') page = <Reference path={route.param} />
+  else if (route.path === 'cards') page = <Cards path={route.param} />
   else if (route.path === 'gradebook') page = <Gradebook />
   else if (route.path === 'users') page = <ManageUsers />
   else page = <Catalog />

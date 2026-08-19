@@ -277,6 +277,13 @@ replaying that lab, which is exactly the problem this page exists to solve.
 - Grouping is by task (`survey`, `operator`, `cluster`, `services`, `connect`, `sql`, `tls`,
   `pooling`, `failover`), not by binary — a learner looks for "how do I see who is primary",
   not for "kubectl".
+- **Group ids and command ids are anchors, so they must be unique within a reference.** The
+  section nav scrolls to `ref-<groupId>` and each entry renders as `cmd-<commandId>`; two
+  groups sharing an id silently send both nav links to the first one. (Two groups were both
+  called `operator` until the second became `operator-runtime`.)
+- `#/reference/<ref>/lab/<labId>` narrows the page to the entries whose `usedIn` names that
+  lab — the link an index card and a lab's detail page follow. It needs no mapping of its own
+  because `usedIn` is authored on both sides and checked against `catalog.json`.
 - The page is **not narrated** and has no speech blocks, so the fenced-code rule that governs
   lab content does not apply to it.
 
@@ -287,6 +294,17 @@ one question and a short answer per card, for testing recall rather than reading
 **per technology** — `cards/cnpg.js` today, and a second technology is a new module plus an
 entry in `DECKS`, with nothing else to change. `cards/index.js` exposes
 `DECKS`/`getDeck`/`allCards`/`CARD_KINDS`/`deckSize`; `pages/Cards.jsx` renders it.
+
+The page has two halves, and content only has to satisfy the contract below to work in both.
+**Browsing** is the searchable grid of face-down cards. **Studying** (`cards/StudySession.jsx`)
+hands over one card at a time with nothing else on screen, takes a self-graded *got it / missed
+it*, and schedules the next sighting. The schedule is **Leitner, five boxes** in
+`cards/review.js` — 0/1/3/7/16 days, a correct answer moves up one box, a miss drops straight
+back to box 1 — persisted to `localStorage` under `dbcanvas_labs_cards`, keyed by user id like
+attempts are. It is deliberately not SM-2: a learner can read that rule in one sentence on the
+page and predict it, which is worth more here than curve accuracy. Sessions are capped at 20
+cards and **shuffled before the cap**, so a deck-wide session samples the whole deck instead of
+replaying its first twenty cards in authored order.
 
 **Index cards are written for both halves of a lab's material: the command reference entry
 and the lecture notes.** They are authored, not generated — a card asks a narrower question
@@ -310,11 +328,29 @@ cover them, in the same change.
   `lecture` for why the system behaves as it does. The page filters on it.
 - `usedIn` is not optional here (it is what turns a card you cannot answer into the lab that
   teaches it), and a wrong id renders as a bare id.
-- Grouping mirrors the reference's task-shaped groups (`survey`, `operator`, `cluster`,
-  `services`, `tls`, `pooling`, `replication`, `lifecycle`, `failover`, `backup`,
-  `observability`) so the two pages can be read side by side.
+- **`usedIn` is also the only cross-link in the app that is not inferred**, so every route
+  between cards, labs and the reference is built on it: `#/cards/<deck>/lab/<labId>` opens a
+  session on that lab's cards (from the lab's detail page and from the debrief),
+  `#/reference/<ref>/lab/<labId>` shows that lab's commands, and a card that cites exactly one
+  lab offers the second directly. A card citing two labs deliberately offers no reference
+  chip — the link would have to pick one, and a link that quietly picks is worse than one more
+  click. Matching cards to individual reference entries by their *content* was tried and
+  abandoned: it produced confident wrong pairings (`who-is-primary` → `replication-slots`).
+  Per-entry linking would need a hand-authored `refId` on each of the 88 command cards.
+- **Card ids are addresses**: `#/cards/<deck>/card/<cardId>` opens the deck with that card
+  revealed, so an id may not be renamed without breaking links people have kept.
+- Grouping is task-shaped, like the reference's, so the two pages can be read side by side:
+  `survey`, `operator`, `cluster`, `services`, `tls`, `pooling`, `replication`, `fencing`,
+  `config`, `scheduling`, `integrity`, `roles`, `failover`, `backup`, `observability`. The
+  five in the middle were one `lifecycle` group until it reached 83 cards — a third of the
+  deck under one heading, which is no grouping at all. **A group is a unit of study, so keep
+  it roughly 5–25 cards**; when one outgrows that, split it by subject rather than letting it
+  absorb everything that has no other home. `backup` (42) and `cluster` (35) are the next two
+  in line.
 - Cards default to **face down** — the page reveals a `back` only on click. That is the point
-  of the page; do not add a mode that renders it as a flat list of answers.
+  of the page; do not add a mode that renders it as a flat list of answers. The page also
+  opens with every group **collapsed**, for the same reason: at 224 cards it is an index of
+  subjects first and a wall of questions second. Searching opens the groups that still match.
 - The page is **not narrated**, so the fenced-code rule that governs lab content does not
   apply. Keep `back` to prose and short inline code regardless — a card with a code block in
   it is too big.
@@ -333,7 +369,10 @@ component library, no state library.
 - `reference/` + `pages/Reference.jsx` — the Command Reference page; see the command
   reference contract above.
 - `cards/` + `pages/Cards.jsx` — the Index Cards page: one deck per technology, cards written
-  from the reference entries and the lecture notes; see the index card contract above.
+  from the reference entries and the lecture notes; see the index card contract above. The
+  directory holds the study loop as well as the content, the way `speech/` does: `review.js`
+  (Leitner boxes in `localStorage`, pure functions), `StudySession.jsx` (one card at a time,
+  keyboard-driven, self-graded) and `CardParts.jsx` (the atoms both halves draw a card from).
 - `pages/LabPlayer.jsx` — the whole workspace, and where the real complexity is: attempt
   bootstrap/resume, provisioning UI, the objective clock, the briefing popup, manual
   check → advance flow.
